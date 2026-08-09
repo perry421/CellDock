@@ -1,125 +1,156 @@
+[English](README.md) · [简体中文](README.zh-CN.md)
+
 <p align="center">
-  <img src="Resources/app_icon.png" width="128" height="128" alt="CellDock 图标">
+  <img src="Resources/app_icon.png" width="128" height="128" alt="CellDock icon">
 </p>
 
 <h1 align="center">CellDock</h1>
 
 <p align="center">
-  在 Mac 上使用蜂窝网络、短信和电话。
+  Use cellular network, SMS, and calls on your Mac.
 </p>
 
 <p align="center">
-  <sub>界面预览 · 点击图片查看原图</sub>
+  <sub>Screenshots · click to view full size</sub>
 </p>
 
-| 短信 | 电话 |
+| SMS | Calls |
 | :---: | :---: |
-| <a href="screenshot/1. sms.png"><img src="screenshot/1. sms.png" width="320" alt="短信"></a> | <a href="screenshot/2. call.png"><img src="screenshot/2. call.png" width="320" alt="电话"></a> |
+| <a href="screenshot/1. sms.png"><img src="screenshot/1. sms.png" width="320" alt="SMS"></a> | <a href="screenshot/2. call.png"><img src="screenshot/2. call.png" width="320" alt="Calls"></a> |
 
-| 通话中 | 通话中 |
+| In-Call | In-Call |
 | :---: | :---: |
-| <a href="screenshot/2.1 calling.png"><img src="screenshot/2.1 calling.png" width="320" alt="通话中"></a> | <a href="screenshot/2.2 calling.png"><img src="screenshot/2.2 calling.png" width="320" alt="通话中"></a> |
+| <a href="screenshot/2.1 calling.png"><img src="screenshot/2.1 calling.png" width="320" alt="In-Call"></a> | <a href="screenshot/2.2 calling.png"><img src="screenshot/2.2 calling.png" width="320" alt="In-Call"></a> |
 
-| 录音 | 代理 |
+| Recordings | Proxy |
 | :---: | :---: |
-| <a href="screenshot/3.records.png"><img src="screenshot/3.records.png" width="320" alt="录音"></a> | <a href="screenshot/4. proxy.png"><img src="screenshot/4. proxy.png" width="320" alt="代理"></a> |
+| <a href="screenshot/3.records.png"><img src="screenshot/3.records.png" width="320" alt="Recordings"></a> | <a href="screenshot/4. proxy.png"><img src="screenshot/4. proxy.png" width="320" alt="Proxy"></a> |
 
-| 设备 | 设置 |
+| Device | Settings |
 | :---: | :---: |
-| <a href="screenshot/5. device.png"><img src="screenshot/5. device.png" width="320" alt="设备"></a> | <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="设置"></a> |
+| <a href="screenshot/5. device.png"><img src="screenshot/5. device.png" width="320" alt="Device"></a> | <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="Settings"></a> |
 
-CellDock 是一款原生 macOS 菜单栏应用，用于连接 QDC507 蜂窝模组。插入模组后，
-你可以直接在 Mac 上使用蜂窝网络、收发短信、管理通讯录、拨打电话、保存通话录音，
-或把指定模组的蜂窝连接作为 SOCKS5 代理共享，无需浏览器服务或额外的通信软件。
+CellDock is a native macOS menu bar app that works with the QDC507 cellular module.
+Plug in the module and you can use the cellular network directly on your Mac — send and
+receive SMS, manage contacts, make calls, save call recordings, or share a module's
+cellular connection as a SOCKS5 proxy — no browser-based service or extra communication
+software required.
 
-## 主要功能
+## Features
 
-### 多模组与蜂窝网络
+### Multi-Module & Cellular Network
 
-- 同时发现并监测多个受支持的 USB 蜂窝模组。
-- 通信模组和上网模组可分别选择；同一时间只有一个模组作为系统的蜂窝优先出口。
-- 每个模组可设为“蜂窝优先”“保持连接”或“关闭”；保持连接的模组可继续供绑定的
-  SOCKS5 代理使用，但不会成为 macOS 的默认网络出口。
-- 开启后自动让蜂窝网络优先于 Wi-Fi。
-- 关闭后恢复原来的网络顺序，不影响短信和来电接收。
-- 每个模组分别保存蜂窝网络开关状态；同一模组重新连接时恢复之前的选择。
-- ECM 链路、DHCP 或模组重启异常时执行有边界的自动恢复。
-- 实时显示运营商、网络制式、信号强度、IP 地址和连接阶段。
-- 可选在菜单栏以固定宽度、上下两行显示实时下载和上传速度，默认关闭。
+- Discovers and monitors multiple supported USB cellular modules at the same time.
+- Choose a separate module for calls and for data; only one module serves as the system's
+  cellular-first egress at a time.
+- Set each module to **Cellular First**, **Keep Connected**, or **Off**. Modules kept
+  connected remain usable by bound SOCKS5 proxies but are not used as macOS's default
+  network egress.
+- Enabling automatically gives cellular priority over Wi-Fi.
+- Disabling restores the previous network order without affecting SMS or incoming calls.
+- Each module remembers its cellular switch state; reconnecting a module restores its
+  previous choice.
+- Bounded automatic recovery when the ECM link, DHCP, or module restart misbehaves.
+- Live display of carrier, network mode, signal strength, IP address, and connection stage.
+- Optional real-time download/upload speeds in the menu bar (fixed width, two lines),
+  off by default.
 
-### SOCKS5 代理
+### SOCKS5 Proxy
 
-- 为不同模组分别创建 SOCKS5 代理，让应用或局域网设备选择具体的蜂窝出口。
-- 可仅监听本机，也可监听局域网；端口从 `1080` 起自动分配并可修改。
-- 支持无认证和用户名/密码认证；局域网监听必须配置认证。
-- 每个代理可独立启停，并显示连接数、模组离线、蜂窝网络关闭、链路中断或端口占用等
-  运行状态。
-- 代理绑定稳定的模组身份；模组重新插入后会重新解析网络接口。认证密码保存在 macOS
-  钥匙串中。
+- Create a separate SOCKS5 proxy per module so apps or LAN devices can select a specific
+  cellular egress.
+- Listen on localhost only or on the LAN; ports are auto-assigned from `1080` and can be
+  changed.
+- Supports no-auth and username/password authentication; LAN listeners require authentication.
+- Each proxy starts and stops independently and reports connection count and status such as
+  module offline, cellular off, link down, or port in use.
+- Proxies bind to a stable module identity and re-resolve the network interface after the
+  module is reinserted. Auth passwords are stored in the macOS Keychain.
 
-> 局域网代理会把蜂窝出口开放给同一网络中的其他设备。请使用强密码，并确认本机防火墙
-> 和所处网络可信。
+> A LAN proxy exposes the cellular egress to other devices on the same network. Use a
+> strong password and make sure your firewall and network are trustworthy.
 
-### 短信
+### SMS
 
-- 后台接收短信并发送 macOS 通知。
-- 按会话查看完整短信，复制正文、回复或新建短信。
-- 发送中文短信和长短信。
-- 自动识别验证码，点击即可复制并标记已读。
-- 短信记录标注来源模组；可在不同可用模组之间选择发送目标。
-- 删除后不再出现在 CellDock；如果短信仍保存在模组中，CellDock 会同时尝试清理。
-- 可选在验证码短信已读 30 分钟后自动删除。
+- Receive SMS in the background with macOS notifications.
+- View full threads by conversation; copy text, reply, or compose new messages.
+- Send Chinese text and long (concatenated) messages.
+- Auto-detects verification codes; click to copy and mark as read.
+- Messages are tagged with their source module; choose which available module sends each
+  message.
+- Deleted messages no longer appear in CellDock; if a message is still stored on the module,
+  CellDock also tries to clear it.
+- Optionally auto-delete verification-code messages 30 minutes after they are read.
 
-### 电话与录音
+### Calls & Recording
 
-- 拨号、接听、拒接、静音和挂断。
-- 来电时显示带“接听”和“拒接”按钮的通知与浮窗。
-- 通话中提供数字拨号盘，可操作客服语音菜单。
-- 使用 Mac 的麦克风和扬声器进行通话。
-- 保存最近通话与未接来电，并记录通话所使用的模组。
-- 支持手动录音和经用户确认后自动录音，录制双方声道并保存为 M4A。
-- 录音库支持波形、播放、跳转、倍速、音量、重命名、导出和在访达中显示。
+- Dial, answer, reject, mute, and hang up.
+- Incoming calls show a notification and floating window with Answer and Decline buttons.
+- In-call keypad for navigating automated phone menus.
+- Use your Mac's microphone and speakers for calls.
+- Keeps recent and missed calls, noting which module was used.
+- Manual and user-confirmed automatic recording captures both parties and saves as M4A.
+- The recording library offers waveforms, playback, seeking, speed control, volume, rename,
+  export, and Reveal in Finder.
 
-> 使用通话录音前，请先取得通话参与者同意，并遵守所在地法律法规。
+> Before recording a call, get consent from all participants and follow local laws.
 
-### SIM、eSIM 与通讯录
+### SIM, eSIM & Contacts
 
-- 查看 SIM 状态、ICCID、IMSI、本机号码、运营商、网络制式和信号信息。
-- 分别配置每个模组是否接收来电；需要重启模组的操作会明确提示。
-- 自动识别物理 SIM 与 eUICC。
-- 对受支持的 eUICC 查看 EID 和套餐，并可下载、启用、停用、重命名或删除 eSIM 套餐。
-- 读取 macOS 系统通讯录，匹配短信与来电姓名。
-- 在 CellDock 中新建、编辑、删除联系人和管理联系人分组。
+- View SIM status, ICCID, IMSI, own number, carrier, network mode, and signal information.
+- Configure per module whether it accepts incoming calls; operations that require a module
+  restart are clearly flagged.
+- Auto-detects physical SIM and eUICC.
+- On supported eUICCs, view the EID and profiles; download, enable, disable, rename, or
+  delete eSIM profiles.
+- Reads the macOS Contacts database to match names on SMS and calls.
+- Create, edit, delete contacts and manage contact groups in CellDock.
 
-### 菜单栏、声音与界面
+### Menu Bar, Sound & Interface
 
-- 支持模组热插拔，无需重启应用。
-- 菜单栏图标显示通话、未接来电、未读短信、当前上网模组或可通话模组状态。
-- 菜单栏面板按模组显示未读短信和未接来电；没有待处理内容时自动隐藏对应区块。
-- 可自定义短信提示音和来电铃声；默认使用 `bleeps.wav` 与 `ring.mp3`。
-- 支持简体中文、English、日本語和 Français，可在设置中即时切换。
-- 支持跟随系统、浅色和深色主题。
-- 演示隐私保护可隐藏联系人、号码、短信正文、验证码和录音标题。
-- 可打开标准主窗口；关闭窗口后继续在菜单栏运行。
-- 可选择模组未插入时隐藏菜单栏图标。
-- 可选择登录 Mac 时自动启动，默认关闭。
-- 内置稳定版和测试版更新频道，可自动检查或手动检查更新。
+- Hot-plug modules without restarting the app.
+- The menu bar icon shows calls, missed calls, unread SMS, the current data module, or
+  callable-module status.
+- The menu bar panel lists unread SMS and missed calls per module and automatically hides
+  empty sections.
+- Customizable SMS sound and ringtone; defaults are `bleeps.wav` and `ring.mp3`.
+- Simplified Chinese, English, 日本語, and Français, switchable instantly in Settings.
+- Follows system, light, and dark themes.
+- Presentation privacy mode hides contacts, numbers, message bodies, verification codes,
+  and recording titles.
+- Open a standard main window; closing it keeps the app running in the menu bar.
+- Optionally hide the menu bar icon when no module is connected.
+- Optionally launch at login, off by default.
+- Built-in stable and beta update channels with automatic or manual update checks.
 
-## 鸣谢
+## Acknowledgments
 
-特别感谢 [moluncn/mavo](https://github.com/moluncn/mavo) 项目。CellDock 在界面与功能设计上参考了 mavo，得益于原作者的开源工作，特此鸣谢。
+Special thanks to the [moluncn/mavo](https://github.com/moluncn/mavo) project. CellDock
+draws on mavo for its interface and feature design; we are grateful for the original
+author's open-source work.
 
-## 免责声明
+## Disclaimer
 
-- CellDock 按“现状”提供，不附带任何明示或默示的担保，作者不对其适用性或特定用途表现作任何保证。
-- 本软件会修改 macOS 的网络配置（例如将蜂窝网络设为优先出口、安装网络辅助组件），可能影响既有网络连接，使用前请确认了解相关功能。
-- 蜂窝网络、短信、电话与 eSIM 等功能的可用性受模组固件、SIM 卡、运营商及当地网络环境影响，作者不保证其在所有环境下的可用性或表现。
-- 将蜂窝连接通过 SOCKS5 代理共享给局域网设备，会将该网络出口暴露给同一网络中的其他设备，请自行评估安全风险并妥善配置认证。
-- 通话录音前请取得通话参与者的同意，并遵守所在地法律法规；使用蜂窝共享等功能时也请遵守运营商的服务条款。
-- 因使用或无法使用本软件而造成的任何直接或间接损失，作者均不承担责任。
+- CellDock is provided "as is", without any express or implied warranty. The author makes
+  no guarantees about its suitability or performance for any particular purpose.
+- The app modifies macOS network configuration (for example, making cellular the priority
+  egress and installing a network helper), which may affect existing network connections.
+  Make sure you understand these features before use.
+- The availability of cellular data, SMS, calls, and eSIM features depends on module
+  firmware, SIM card, carrier, and local network conditions. The author does not guarantee
+  their availability or performance in every environment.
+- Sharing a cellular connection to LAN devices through the SOCKS5 proxy exposes that egress
+  to other devices on the same network. Assess the security risks yourself and configure
+  authentication properly.
+- Get consent from call participants before recording and follow local laws; also follow
+  your carrier's terms of service when using features such as connection sharing.
+- The author is not liable for any direct or indirect loss caused by using or being unable
+  to use this software.
 
-## 许可证
+## License
 
-CellDock 应用代码使用[非商业使用许可](LICENSE)：个人和非商业用途可免费使用、
-修改与分发；**禁止任何形式的商业使用**，商业使用需另行获得作者书面授权。
-第三方组件及其许可证说明见 [THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md)。
+CellDock's application code is licensed under a [non-commercial license](LICENSE): free to
+use, modify, and distribute for personal and non-commercial purposes. **Any form of
+commercial use is prohibited**; commercial use requires separate written authorization from
+the author. Third-party components and their licenses are listed in
+[THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md).
