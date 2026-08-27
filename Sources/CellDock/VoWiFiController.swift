@@ -133,7 +133,7 @@ final class VoWiFiController: ObservableObject {
         switch module.modem.usbConfiguration?.usbProfile {
         case .djiOriginal, .cellDockCompatible, nil:
             voWiFiLogger.info("VoWiFi USB profile accepted module=\(moduleID.rawValue, privacy: .public)")
-        case let .unsupported?:
+        case .unsupported?:
             // Still attempt the launch; if it fails the egress/preflight stage
             // below reports the precise reason. No silent rollback to audio=1.
             voWiFiLogger.warning("VoWiFi USB profile=unsupported module=\(moduleID.rawValue, privacy: .public) continuing preflight")

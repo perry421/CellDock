@@ -18,17 +18,13 @@
 | :---: | :---: |
 | <a href="screenshot/1. sms.png"><img src="screenshot/1. sms.png" width="320" alt="SMS"></a> | <a href="screenshot/2. call.png"><img src="screenshot/2. call.png" width="320" alt="Calls"></a> |
 
-| In-Call | In-Call |
-| :---: | :---: |
-| <a href="screenshot/2.1 calling.png"><img src="screenshot/2.1 calling.png" width="320" alt="In-Call"></a> | <a href="screenshot/2.2 calling.png"><img src="screenshot/2.2 calling.png" width="320" alt="In-Call"></a> |
-
 | Recordings | Proxy |
 | :---: | :---: |
 | <a href="screenshot/3.records.png"><img src="screenshot/3.records.png" width="320" alt="Recordings"></a> | <a href="screenshot/4. proxy.png"><img src="screenshot/4. proxy.png" width="320" alt="Proxy"></a> |
 
-| Device | Settings |
-| :---: | :---: |
-| <a href="screenshot/5. device.png"><img src="screenshot/5. device.png" width="320" alt="Device"></a> | <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="Settings"></a> |
+| Settings |
+| :---: |
+| <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="Settings"></a> |
 
 CellDock is a native macOS menu bar app that works with the QDC507 cellular module.
 Plug in the module and you can use the cellular network directly on your Mac — send and
@@ -122,6 +118,79 @@ software required.
 - Optionally hide the menu bar icon when no module is connected.
 - Optionally launch at login, off by default.
 - Built-in stable and beta update channels with automatic or manual update checks.
+
+### USB Modes, Recovery & Diagnostics
+
+- Inspects and validates the QDC507 USB composition before changing it.
+- Switches between Mac mode (USB audio enabled) and iPhone mode (USB audio disabled)
+  while preserving diagnostic, NMEA, AT, modem, network, and ADB fields outside the
+  requested transition.
+- Saves the previous USB configuration and recovers an interrupted transition without
+  silently applying a persistent factory reset.
+- Recovers boundedly after cold plug, delayed AT or registration, module reboot, USB
+  reinsertion, ECM/DHCP failure, and macOS sleep/wake.
+- Records recovery attempts, failure stage, duration, CFUN power transitions, modem
+  rediscovery, AT restoration, and internet restoration.
+- Settings includes **Copy Connection Diagnostics Report**. The report covers USB
+  detection/profile, AT availability, SIM readiness, carrier/RAT/signal, network
+  interface and reachability, recovery history, sleep/wake, and power-management state.
+- Diagnostic reports intentionally omit ICCID, IMSI, IMEI, and telephone numbers. The
+  current UI copies the report to the clipboard; standalone file export is not shipped.
+- The USB mode test surface executes explicitly entered diagnostic AT commands through
+  the existing modem service instead of opening a second USB or serial connection.
+
+### Remote & Agent Bridges
+
+- A token-authenticated local WebSocket bridge exposes redacted device status and bounded
+  call controls to the experimental iOS companion under `ios/CellDockRemote`.
+- `NeedleBridge` provides an optional tool-routing process for status, call, and messaging
+  actions. It uses `NEEDLE_PYTHON` or standard Python locations and is tested separately.
+
+## Getting Started
+
+Requirements:
+
+- macOS 14 or later on Apple silicon
+- Xcode 16 or later with Swift 6 support
+- A supported QDC507/DJI 4G USB module and a compatible SIM for live modem features
+
+Clone and run the offline verification gate:
+
+```sh
+git clone https://github.com/perry421/CellDock.git
+cd CellDock
+zsh scripts/run_tests.sh
+swift build -c release
+```
+
+Run the development executable with `swift run CellDock`. Hardware-dependent call, SMS,
+USB composition, network recovery, and Remote Bridge checks require a connected module;
+the default self-tests use synthetic fixtures and do not make live calls.
+
+The signed app archive script is `scripts/build_app.sh`. It requires a certificate-backed
+Apple Development or Developer ID Application identity; ad-hoc archives are deliberately
+rejected to preserve Keychain and helper identity continuity.
+
+## Project Structure
+
+- `Sources/CellDock`: macOS SwiftUI app, modem service, SMS/call/network state, recovery,
+  USB mode control, and Diagnostics UI.
+- `Sources/CModemBridge`: single IOKit/USB bridge used by the modem service.
+- `Sources/CellDockNetworkHelper`: privileged network-order and interface operations.
+- `Sources/NeedleBridge` and `Sources/NeedleLibrary`: optional local agent bridge.
+- `ThirdParty`: vendored telephony/eSIM components under their original licenses.
+- `Tests` and `scripts/run_tests.sh`: deterministic self-tests and fixture coverage.
+- `ios/CellDockRemote`: experimental iOS companion package.
+
+## Known Limitations & Roadmap
+
+- Hardware support is currently centered on the QDC507/DJI 4G module and macOS 14+.
+- Carrier firmware, SIM provisioning, USB topology, and macOS network policy can affect
+  data, SMS, voice, and eSIM behavior.
+- The iOS companion and Needle bridge are experimental developer surfaces.
+- Diagnostics can be copied to the clipboard but are not yet exported as a file bundle.
+- Future work includes broader modem validation, a packaged diagnostics archive, and more
+  hardware-in-the-loop recovery coverage.
 
 ## Acknowledgments
 

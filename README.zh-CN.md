@@ -18,17 +18,13 @@
 | :---: | :---: |
 | <a href="screenshot/1. sms.png"><img src="screenshot/1. sms.png" width="320" alt="短信"></a> | <a href="screenshot/2. call.png"><img src="screenshot/2. call.png" width="320" alt="电话"></a> |
 
-| 通话中 | 通话中 |
-| :---: | :---: |
-| <a href="screenshot/2.1 calling.png"><img src="screenshot/2.1 calling.png" width="320" alt="通话中"></a> | <a href="screenshot/2.2 calling.png"><img src="screenshot/2.2 calling.png" width="320" alt="通话中"></a> |
-
 | 录音 | 代理 |
 | :---: | :---: |
 | <a href="screenshot/3.records.png"><img src="screenshot/3.records.png" width="320" alt="录音"></a> | <a href="screenshot/4. proxy.png"><img src="screenshot/4. proxy.png" width="320" alt="代理"></a> |
 
-| 设备 | 设置 |
-| :---: | :---: |
-| <a href="screenshot/5. device.png"><img src="screenshot/5. device.png" width="320" alt="设备"></a> | <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="设置"></a> |
+| 设置 |
+| :---: |
+| <a href="screenshot/6. settings.png"><img src="screenshot/6. settings.png" width="320" alt="设置"></a> |
 
 CellDock 是一款原生 macOS 菜单栏应用，用于连接 QDC507 蜂窝模组。插入模组后，
 你可以直接在 Mac 上使用蜂窝网络、收发短信、管理通讯录、拨打电话、保存通话录音，
@@ -106,6 +102,70 @@ CellDock 是一款原生 macOS 菜单栏应用，用于连接 QDC507 蜂窝模�
 - 可选择模组未插入时隐藏菜单栏图标。
 - 可选择登录 Mac 时自动启动，默认关闭。
 - 内置稳定版和测试版更新频道，可自动检查或手动检查更新。
+
+### USB 模式、恢复与诊断
+
+- 修改前读取并校验 QDC507 USB composition。
+- 支持 Mac Mode（开启 USB Audio）与 iPhone Mode（关闭 USB Audio）切换，同时保留
+  诊断、NMEA、AT、Modem、网络和 ADB 等未被本次操作指定的字段。
+- 保存切换前配置，并能恢复中断的 USB 转换；不会静默执行持久化恢复出厂操作。
+- 对冷插入、AT 或注册延迟、模组重启、USB 重插、ECM/DHCP 异常和 macOS 睡眠唤醒
+  进行有界恢复。
+- 记录恢复次数、失败阶段、耗时、CFUN 电源切换、模组重新发现、AT 恢复和网络恢复。
+- 设置中的“复制连接诊断报告”覆盖 USB、AT、SIM 就绪状态、运营商/RAT/信号、网络
+  接口与连通性、恢复历史、睡眠唤醒和电源管理状态。
+- 诊断报告明确排除 ICCID、IMSI、IMEI 和电话号码。当前可复制到剪贴板，尚未提供
+  独立文件导出。
+- USB 模式测试页通过现有 ModemService 执行用户明确输入的诊断 AT 命令，不会另开
+  第二条 USB 或串口连接。
+
+### 远程与 Agent Bridge
+
+- 本地 WebSocket Bridge 使用令牌认证，向 `ios/CellDockRemote` 实验性 iOS 伴侣提供
+  脱敏设备状态和受限通话控制。
+- `NeedleBridge` 提供可选的状态、通话和短信工具路由进程，通过 `NEEDLE_PYTHON` 或
+  标准 Python 路径启动，并有独立测试。
+
+## 开始使用
+
+要求：
+
+- Apple Silicon Mac，macOS 14 或更高版本
+- Xcode 16 或更高版本，支持 Swift 6
+- 真实模组功能需要受支持的 QDC507/DJI 4G USB 模组和兼容 SIM
+
+Clone 后运行离线验证：
+
+```sh
+git clone https://github.com/perry421/CellDock.git
+cd CellDock
+zsh scripts/run_tests.sh
+swift build -c release
+```
+
+开发运行使用 `swift run CellDock`。通话、短信、USB composition、网络恢复和 Remote
+Bridge 真机检查需要连接模组；默认自测使用匿名 fixture，不会发起真实拨号。
+
+签名 App 归档脚本为 `scripts/build_app.sh`，必须提供 Apple Development 或 Developer ID
+Application 证书。脚本会拒绝 ad-hoc 归档，避免破坏钥匙串与 helper 身份连续性。
+
+## 项目结构
+
+- `Sources/CellDock`：macOS SwiftUI App、ModemService、短信/电话/网络状态、恢复、USB 模式和诊断界面。
+- `Sources/CModemBridge`：ModemService 使用的单一 IOKit/USB bridge。
+- `Sources/CellDockNetworkHelper`：网络顺序和接口操作 helper。
+- `Sources/NeedleBridge`、`Sources/NeedleLibrary`：可选本地 Agent bridge。
+- `ThirdParty`：按原许可证保留的电话与 eSIM 第三方组件。
+- `Tests`、`scripts/run_tests.sh`：确定性自测和匿名 fixture。
+- `ios/CellDockRemote`：实验性 iOS 伴侣 package。
+
+## 已知限制与 Roadmap
+
+- 硬件支持目前以 QDC507/DJI 4G 模组和 macOS 14+ 为主。
+- 运营商固件、SIM 开通状态、USB 拓扑和 macOS 网络策略会影响数据、短信、通话和 eSIM。
+- iOS 伴侣和 Needle bridge 仍属于实验性开发界面。
+- Diagnostics 当前可复制到剪贴板，尚未导出为独立文件包。
+- 后续计划包括更多模组验证、打包式诊断归档和更完整的真机恢复覆盖。
 
 ## 鸣谢
 
