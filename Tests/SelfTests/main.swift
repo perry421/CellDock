@@ -9,6 +9,12 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw SelfTestFailure.failed(message) }
 }
 
+/// Parses the given AT outcome, throwing a test failure if it was nil.
+func expectNonNil<Value>(_ value: Value?, _ message: String) throws -> Value {
+    guard let value else { throw SelfTestFailure.failed(message) }
+    return value
+}
+
 func expectDecodeFailure(_ pdu: String, _ message: String) throws {
     do {
         _ = try SMSPDUDecoder.decode(pdu)
@@ -140,14 +146,25 @@ do {
     )
     try expect(
         launchAgentPropertyList["ProgramArguments"] as? [String] == [
-            "/usr/bin/open", "-g", "/Users/test/Applications/CellDock.app",
+            "/usr/bin/open", "-g", "/Users/test/Applications/CellDock.app", "--args",
+            "--background-connection-service",
         ],
-        "LaunchAgent app path"
+        "LaunchAgent app path and background recovery argument"
     )
     try expect(
         launchAgentPropertyList["RunAtLoad"] as? Bool == true &&
             launchAgentPropertyList["KeepAlive"] == nil,
         "LaunchAgent must run once per login without relaunching after a manual quit"
+    )
+    try expect(
+        !CellDockLaunchContext.shouldShowInitialWindow(arguments: [
+            "/Applications/CellDock.app/Contents/MacOS/CellDock",
+            "--background-connection-service",
+        ]) &&
+            CellDockLaunchContext.shouldShowInitialWindow(arguments: [
+                "/Applications/CellDock.app/Contents/MacOS/CellDock",
+            ]),
+        "background login launch did not suppress only the initial window"
     )
     _ = try PropertyListSerialization.data(
         fromPropertyList: launchAgentPropertyList,
@@ -750,6 +767,18 @@ do {
         ) == .qpcmv,
         "standard EC25 raw PCM backend selection"
     )
+    try expect(
+        CallATParser.isQDCVoiceFirmware("QDC507GLEFM21_01.001.01.007"),
+        "QDC507 firmware not recognised as UAC voice firmware"
+    )
+    try expect(
+        CallATParser.isQDCVoiceFirmware("EG25G_QDC507"),
+        "EG25-G firmware variant not recognised as UAC voice firmware"
+    )
+    try expect(
+        !CallATParser.isQDCVoiceFirmware("EC25EFAR06A06M4G"),
+        "standard EC25 misclassified as UAC voice firmware"
+    )
     var callFramer = CallURCStreamFramer()
     try expect(callFramer.consume("\r\n+CLI").isEmpty, "partial CLIP emitted")
     try expect(
@@ -873,6 +902,71 @@ do {
     try expect(
         framer.consume("\(ucs2PDU)\r\n").directPDUs == [ucs2PDU],
         "interleaved command response discarded a pending direct CMT"
+    )
+
+    // Text-mode `+CMT:` deliveries — used when CellDock opts into SMS
+    // reception. The header carries the originating address + SCTS, the
+    // following line is the raw body (UTF-8, possibly empty or Chinese).
+    try expect(
+        ATResponseParser.isTextModeCMTHeader("+CMT: \"+8613812345678\",\"\",\"26/08/26,12:15:23+32\""),
+        "text-mode +CMT header misclassified as PDU mode"
+    )
+    try expect(
+        !ATResponseParser.isTextModeCMTHeader("+CMT: ,22"),
+        "PDU-mode +CMT header misclassified as text mode"
+    )
+    let parsedTimestamp = ATResponseParser.parseSCTSTimestamp("26/08/26,12:15:23+32")
+    try expect(
+        parsedTimestamp != nil &&
+            parsedTimestamp.map { Int($0.timeIntervalSince1970) } != nil,
+        "SCTS year parsing"
+    )
+    try expect(
+        ATResponseParser.parseSCTSTimestamp("garbage") == nil,
+        "SCTS accepted garbage"
+    )
+
+    var textFramer = ModemURCStreamFramer()
+    let headerLine = "+CMT: \"+8613812345678\",\"\",\"26/08/26,12:15:23+32\""
+    let bodyLine = "测试短信 Hello"
+    let first = textFramer.consume("\(headerLine)\r\n\(bodyLine)\r\n")
+    try expect(
+        first.textModeCMTs.count == 1 &&
+            first.textModeCMTs.first?.message.sender == "+8613812345678" &&
+            first.textModeCMTs.first?.message.body == "测试短信 Hello" &&
+            first.textModeCMTs.first?.message.timestamp != nil,
+        "text-mode +CMT delivery was not framed"
+    )
+
+    // Empty bodies must not crash and must still be reported as a message.
+    let empty = textFramer.consume("+CMT: \"+8613800000000\",\"\",\"26/08/26,12:20:00+32\"\r\n\r\n")
+    try expect(
+        empty.textModeCMTs.first?.message.body == "",
+        "empty text-mode body was dropped or misread"
+    )
+
+    // Malformed header — must not crash, must not emit.
+    let malformed = textFramer.consume("+CMT: \r\nbroken\r\n")
+    try expect(malformed.textModeCMTs.isEmpty, "malformed text-mode +CMT emitted a message")
+
+    // Coexistence with a normal AT command response in the same buffer.
+    var mixedFramer = ModemURCStreamFramer()
+    let mixed = mixedFramer.consume(
+        "AT+CSQ\r\n+CSQ: 20,99\r\nOK\r\n\(headerLine)\r\n\(bodyLine)\r\n"
+    )
+    try expect(
+        mixed.textModeCMTs.first?.message.sender == "+8613812345678",
+        "text-mode +CMT interleaved with AT command response was lost"
+    )
+
+    // Two consecutive text-mode deliveries must not be merged.
+    let secondHeader = "+CMT: \"BANK\",\"\",\"26/08/26,12:30:00+32\""
+    let secondBody = "您的验证码为 123456"
+    let consecutive = textFramer.consume("\(secondHeader)\r\n\(secondBody)\r\n")
+    try expect(
+        consecutive.textModeCMTs.count == 1 &&
+            consecutive.textModeCMTs.first?.message.body == secondBody,
+        "consecutive text-mode +CMT deliveries collided"
     )
 
     let commandTail = framer.consume("\r\nOK\r\n+CMTI: \"ME\",")
@@ -1116,6 +1210,7 @@ do {
     let qcsq = ATResponseParser.parseQCSQ("\r\n+QCSQ: \"LTE\",-65,-96,140,-11\r\nOK\r\n")
     try expect(qcsq?.dbm == -96, "QCSQ RSRP")
     try expect(qcsq?.technology == "LTE", "QCSQ RAT")
+    try expect(qcsq?.detail.contains("SINR raw 140") == true, "QCSQ SINR diagnostics")
     try expect(ModemSnapshot().initialSetupState == .insertModule, "setup did not request module")
     let djiUSBConfiguration = ATResponseParser.parseUSBConfiguration(
         "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0,0\r\nOK"
@@ -1147,6 +1242,166 @@ do {
         ModemUSBConfiguration.maVoTarget.usbcfgWriteCommand ==
             "AT+QCFG=\"USBCFG\",0x2C7C,0x0125,1,1,1,1,1,1,1",
         "CellDock target USBCFG write command"
+    )
+    // Test 1 — DJI original (audio/UAC=1) is a legal profile.
+    let djiOriginalProfile = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,1\r\nOK"
+    )
+    try expect(djiOriginalProfile?.usbProfile == .djiOriginal, "audio=1 QDC507 was not DJI original")
+    try expect(djiOriginalProfile?.isRecognizedQDC507Profile == true, "DJI original profile was not recognized")
+    // Test 2 — CellDock compatible (audio/UAC=0) is a legal profile.
+    let cellDockCompatibleProfile = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,0\r\nOK"
+    )
+    try expect(
+        cellDockCompatibleProfile?.usbProfile == .cellDockCompatible,
+        "audio=0 QDC507 was not CellDock compatible"
+    )
+    try expect(
+        cellDockCompatibleProfile?.isRecognizedQDC507Profile == true,
+        "CellDock compatible audio=0 profile was incorrectly marked needs configuration"
+    )
+    // Test 3 — NET disabled should not be an acceptable VoWiFi-ready profile.
+    let netDisabled = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,0,1,0\r\nOK"
+    )
+    try expect(netDisabled?.usbProfile == .unsupported, "net=0 was not classified as unsupported")
+    // Test 4 — AT disabled should not be an acceptable VoWiFi-ready profile.
+    let atDisabled = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,0,1,1,1,0\r\nOK"
+    )
+    try expect(atDisabled?.usbProfile == .unsupported, "at=0 was not classified as unsupported")
+    // Test 5 — only the audio/UAC field differs between original and compatible.
+    try expect(
+        djiOriginalProfile != nil && cellDockCompatibleProfile != nil &&
+            djiOriginalProfile!.vendorID == cellDockCompatibleProfile!.vendorID &&
+            djiOriginalProfile!.productID == cellDockCompatibleProfile!.productID &&
+            djiOriginalProfile!.diagnosticEnabled == cellDockCompatibleProfile!.diagnosticEnabled &&
+            djiOriginalProfile!.nmeaEnabled == cellDockCompatibleProfile!.nmeaEnabled &&
+            djiOriginalProfile!.atPortEnabled == cellDockCompatibleProfile!.atPortEnabled &&
+            djiOriginalProfile!.modemEnabled == cellDockCompatibleProfile!.modemEnabled &&
+            djiOriginalProfile!.networkEnabled == cellDockCompatibleProfile!.networkEnabled &&
+            djiOriginalProfile!.adbEnabled == cellDockCompatibleProfile!.adbEnabled &&
+            djiOriginalProfile!.audioEnabled != cellDockCompatibleProfile!.audioEnabled,
+        "original vs compatible diffs went beyond the audio/UAC field"
+    )
+    // Test 6 — VoWiFi preflight uses cellDockCompatible audio=0 without a USB
+    // config guard blocking it: the snapshot must not be "needs configuration".
+    let compatibleReady = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        usbNetMode: 1,
+        usbConfiguration: cellDockCompatibleProfile
+    )
+    try expect(
+        compatibleReady.usbConfiguration?.usbProfile == .cellDockCompatible,
+        "compatible profile not recognized before preflight check"
+    )
+    try expect(
+        compatibleReady.initialSetupState != .unsupportedUSBConfiguration(compatibleReady.usbConfiguration!.compactDescription),
+        "audio=0 profile was gated by USB configuration validation"
+    )
+    try expect(
+        compatibleReady.initialSetupState == .ready,
+        "audio=0 usbnet=1 QDC507 was not classified as ready"
+    )
+    try expect(
+        compatibleReady.operationalState == .ready,
+        "audio=0 QDC507 did not reach a ready operational state"
+    )
+    // adb=0 must remain a Configuration Required / unsupported profile.
+    let adbDisabled = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,0,0\r\nOK"
+    )
+    try expect(adbDisabled?.usbProfile == .unsupported, "adb=0 was not classified as unsupported")
+    try expect(
+        ModemSnapshot(
+            state: .connected,
+            usbIdentity: "2C7C:0125",
+            usbNetMode: 1,
+            usbConfiguration: adbDisabled
+        ).operationalState == .configurationRequired,
+        "adb=0 QDC507 was not marked configuration required"
+    )
+    // Wrong VID/PID identity must be unsupported, never a valid profile.
+    let wrongIdentity = ATResponseParser.parseUSBConfiguration(
+        "+QCFG: \"usbcfg\",0x2C7C,0x9999,1,1,1,1,1,1,0\r\nOK"
+    )
+    try expect(wrongIdentity?.usbProfile == .unsupported, "unrecognized product ID was not unsupported")
+    try expect(
+        ModemSnapshot(
+            state: .connected,
+            usbIdentity: "2C7C:9999",
+            usbNetMode: 1,
+            usbConfiguration: wrongIdentity
+        ).operationalState == .configurationRequired,
+        "unrecognized identity was not classified as needing configuration"
+    )
+    // Malformed USBCFG must fail to parse (→ error path, never ready).
+    try expect(
+        ATResponseParser.parseUSBConfiguration("+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1\r\nOK") == nil,
+        "malformed USBCFG was parsed as a valid configuration"
+    )
+    // VoWiFi unavailable + a valid module must still be Ready: the module's
+    // operational state is decoupled from optional VoWiFi / Voice runtimes.
+    let voWiFiDisabledButModuleValid = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        voiceRegistrationState: .notRegistered,
+        usbNetMode: 1,
+        volteSessionAvailable: false,
+        usbConfiguration: cellDockCompatibleProfile
+    )
+    try expect(
+        voWiFiDisabledButModuleValid.operationalState == ModemOperationalState.ready,
+        "optional VoWiFi/Voice unavailability incorrectly blocked module Ready"
+    )
+
+    // ---- Module status UI presentation mapping ----
+    // ready + cellDockCompatible (audio=0) → Ready / Valid / Mobile.
+    let compatiblePanel = ModemModuleStatusPresentation.derive(snapshot: compatibleReady)
+    try expect(compatiblePanel.status == .ready, "compatible module status was not ready")
+    try expect(compatiblePanel.configuration == .valid, "compatible module config was not valid")
+    try expect(compatiblePanel.profile == .cellDockCompatible, "compatible module profile mismatch")
+    try expect(compatiblePanel.usbMode == .mobile, "compatible audio=0 was not mobile mode")
+    try expect(compatiblePanel.audio == .disabled, "compatible audio was not disabled")
+    try expect(compatiblePanel.at == .available, "compatible AT was not available")
+    try expect(compatiblePanel.network == .available, "compatible NET was not available")
+    try expect(compatiblePanel.adb == .available, "compatible ADB was not available")
+    // ready + djiOriginal (audio=1) → Ready / Valid / Mac.
+    let originalReady = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        usbNetMode: 1,
+        usbConfiguration: djiOriginalProfile
+    )
+    let originalPanel = ModemModuleStatusPresentation.derive(snapshot: originalReady)
+    try expect(originalPanel.status == .ready, "original module status was not ready")
+    try expect(originalPanel.configuration == .valid, "original module config was not valid")
+    try expect(originalPanel.profile == .djiOriginal, "original module profile mismatch")
+    try expect(originalPanel.usbMode == .mac, "original audio=1 was not mac mode")
+    try expect(originalPanel.audio == .enabled, "original audio was not enabled")
+    // unsupported net=0 → Configuration Required / network unavailable.
+    let netOffReady = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        usbNetMode: 1,
+        usbConfiguration: netDisabled
+    )
+    let netOffPanel = ModemModuleStatusPresentation.derive(snapshot: netOffReady)
+    try expect(netOffPanel.status == .configurationRequired, "net=0 status was not configuration required")
+    try expect(netOffPanel.network == .unavailable, "net=0 network was not unavailable")
+    try expect(
+        netOffPanel.configuration == .needsRepair(.networkDisabled),
+        "net=0 did not report a concrete network interface problem"
+    )
+    try expect(netOffPanel.usbMode == .unknown, "unsupported profile should not imply a USB mode")
+    // Disconnected → Disconnected.
+    let disconnectedPanel = ModemModuleStatusPresentation.derive(snapshot: ModemSnapshot())
+    try expect(disconnectedPanel.status == .disconnected, "empty modem was not disconnected")
+    try expect(
+        disconnectedPanel.configuration == .needsRepair(.malformed),
+        "empty modem did not report malformed/missing USBCFG"
     )
     try expect(
         ATResponseParser.parseQADBKeyChallenge("\r\n+QADBKEY: 10827907\r\n\r\nOK\r\n") == "10827907",
@@ -3337,6 +3592,25 @@ do {
         "vowifi-go SWu establishment was not reported"
     )
 
+    let voWiFiTunnelBlocked = VoWiFiRuntimeStatus.parse(keyValueOutput: """
+    protocol=4
+    supported=1
+    running=1
+    session=\(voWiFiSession)
+    phase=tunnel_blocked
+    dataplane_mode=userspace
+    sim_ready=1
+    access_ready=1
+    tunnel_ready=0
+    last_reason=SWU tunnel establishment failed: IKE response timeout
+    """)
+    try expect(
+        VoWiFiSessionState(
+            status: voWiFiTunnelBlocked, expectedSessionID: voWiFiSession
+        ) == .establishingTunnel(voWiFiTunnelBlocked),
+        "a blocked ePDG stage was misreported as a runtime process failure"
+    )
+
     let voWiFiRegisteringIMS = VoWiFiRuntimeStatus.parse(keyValueOutput: """
     protocol=4
     supported=1
@@ -3422,8 +3696,946 @@ do {
         // Expected.
     }
 
-    print("CellDock self-tests passed (calls, PDU/UDH, SOCKS5, VoWiFi, buffering, storage, merge).")
+    print("CellDock self-tests passed (calls, PDU/UDH, SOCKS5, VoWiFi, buffering, storage, merge, USB config).")
 } catch {
     fputs("Self-test failed: \(error)\n", stderr)
     exit(1)
+}
+
+// MARK: - USBConfiguration + USBModeController Tests
+
+do {
+    // --- USBConfiguration parsing tests ---
+
+    // 1. Real DJOneHub/EG25 USBCFG response
+    let realResponse = "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0,0\r\nOK\r\n"
+    let realConfig = try USBConfiguration.parse(response: realResponse).get()
+    try expect(realConfig.vendorID == 0x2CA3, "real response VID mismatch")
+    try expect(realConfig.productID == 0x4006, "real response PID mismatch")
+    try expect(realConfig.atEnabled == true, "real response AT mismatch")
+    try expect(realConfig.nmeaEnabled == true, "real response NMEA mismatch")
+    try expect(realConfig.diagEnabled == true, "real response DIAG mismatch")
+    try expect(realConfig.modemEnabled == true, "real response modem mismatch")
+    try expect(realConfig.reservedFlag == true, "real response reserved mismatch")
+    try expect(realConfig.adbEnabled == false, "real response ADB mismatch")
+    try expect(realConfig.uacEnabled == false, "real response UAC mismatch")
+
+    // 2. Response with AT echo
+    let echoResponse = "AT+QCFG=\"usbcfg\"\r\n+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,1,1\r\nOK\r\n"
+    let echoConfig = try USBConfiguration.parse(response: echoResponse).get()
+    try expect(echoConfig.uacEnabled == true, "AT echo response UAC mismatch")
+    try expect(echoConfig.adbEnabled == true, "AT echo response ADB mismatch")
+
+    // 3. Response with CRLF + OK
+    let crlfResponse = "\r\n+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0,1\r\n\r\nOK\r\n"
+    let crlfConfig = try USBConfiguration.parse(response: crlfResponse).get()
+    try expect(crlfConfig.uacEnabled == true, "CRLF response UAC mismatch")
+
+    // 4. Malformed response - missing +QCFG prefix
+    do {
+        _ = try USBConfiguration.parse(response: "garbage").get()
+        throw SelfTestFailure.failed("malformed response was accepted")
+    } catch USBConfiguration.USBConfigurationError.missingUSBCFGPrefix {
+        // Expected
+    }
+
+    // 5. Missing field (only 8 fields)
+    do {
+        _ = try USBConfiguration.parse(response: "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0\r\n").get()
+        throw SelfTestFailure.failed("missing field was accepted")
+    } catch USBConfiguration.USBConfigurationError.unsupportedFieldCount(8) {
+        // Expected
+    }
+
+    // 6. Invalid numeric field (non-hex VID)
+    do {
+        _ = try USBConfiguration.parse(response: "+QCFG: \"usbcfg\",ZZZZ,0x4006,1,1,1,1,1,0,0\r\n").get()
+        throw SelfTestFailure.failed("invalid hex VID was accepted")
+    } catch USBConfiguration.USBConfigurationError.invalidHexField {
+        // Expected
+    }
+
+    // 7. Invalid binary field (value 2)
+    do {
+        _ = try USBConfiguration.parse(response: "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0,2\r\n").get()
+        throw SelfTestFailure.failed("invalid binary field was accepted")
+    } catch USBConfiguration.USBConfigurationError.invalidBinaryField {
+        // Expected
+    }
+
+    // 8. Empty response
+    do {
+        _ = try USBConfiguration.parse(response: "").get()
+        throw SelfTestFailure.failed("empty response was accepted")
+    } catch USBConfiguration.USBConfigurationError.emptyResponse {
+        // Expected
+    }
+
+    // --- USBModeController transformation tests ---
+
+    let executor: USBModeController.ATCommandExecutor = { _, _ in ("", 0) }
+    let controller = USBModeController(executor: executor)
+
+    let macFullConfig = try USBConfiguration.parse(
+        response: "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,1,1\r\n"
+    ).get()
+
+    // 9. Mac → Mobile transformation (UAC off)
+    let mobileDesired = controller.configuration(from: macFullConfig, for: .mobile)
+    try expect(mobileDesired != nil, "mac→mobile returned nil (should produce target)")
+    try expect(mobileDesired!.uacEnabled == false, "mac→mobile did not clear UAC")
+
+    // 10-13. Non-UAC fields unchanged
+    try expect(mobileDesired!.vendorID == macFullConfig.vendorID, "VID changed during mac→mobile")
+    try expect(mobileDesired!.productID == macFullConfig.productID, "PID changed during mac→mobile")
+    try expect(mobileDesired!.atEnabled == macFullConfig.atEnabled, "AT changed during mac→mobile")
+    try expect(mobileDesired!.modemEnabled == macFullConfig.modemEnabled, "modem changed during mac→mobile")
+
+    // 14. Validate diff only touches UAC
+    let diffResult = controller.validateDiff(from: macFullConfig, to: mobileDesired!)
+    switch diffResult {
+    case .success(let desc):
+        try expect(desc.contains("UAC"), "diff description did not mention UAC")
+    case .failure(let error):
+        throw SelfTestFailure.failed("validateDiff failed: \(error)")
+    }
+
+    // 15. Mobile → Mac transformation (UAC on)
+    let mobileConfig = try USBConfiguration.parse(
+        response: "+QCFG: \"usbcfg\",0x2CA3,0x4006,1,1,1,1,1,0,0\r\n"
+    ).get()
+    let macDesired = controller.configuration(from: mobileConfig, for: .mac)
+    try expect(macDesired != nil, "mobile→mac returned nil")
+    try expect(macDesired!.uacEnabled == true, "mobile→mac did not enable UAC")
+    try expect(macDesired!.vendorID == mobileConfig.vendorID, "VID changed during mobile→mac")
+
+    // 16. Already mobile → mobile = no-op (nil)
+    let noOpMobile = controller.configuration(from: mobileConfig, for: .mobile)
+    try expect(noOpMobile == nil, "already mobile→mobile should be nil")
+
+    // 17. Already mac → mac = no-op (nil)
+    let noOpMac = controller.configuration(from: macFullConfig, for: .mac)
+    try expect(noOpMac == nil, "already mac→mac should be nil")
+
+    // 18. Round-trip: parse → serialize → parse
+    let serialized = realConfig.writeCommand
+    try expect(serialized.hasPrefix("AT+QCFG=\"usbcfg\","), "writeCommand prefix wrong")
+    let fields = String(serialized.dropFirst("AT+QCFG=\"usbcfg\",".count))
+    let roundTrip = try USBConfiguration.parse(
+        response: "+QCFG: \"usbcfg\",\(fields)\r\n"
+    ).get()
+    try expect(roundTrip == realConfig, "round-trip parse did not reproduce original config")
+
+    // 19. Validate diff catches unexpected VID change
+    let vidDiff = controller.validateDiff(
+        from: realConfig,
+        to: USBConfiguration(vendorID: 0xFFFF, productID: realConfig.productID,
+                              atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+                              modemEnabled: true, reservedFlag: true, adbEnabled: false,
+                              uacEnabled: false)
+    )
+    switch vidDiff {
+    case .failure(.unexpectedFieldChange("VendorID")):
+        break // Expected
+    default:
+        throw SelfTestFailure.failed("VID diff not caught")
+    }
+
+    print("USB configuration tests passed (parse, transform, validate, round-trip).")
+}
+
+do {
+    // ============================================================
+    // MARK: - USB Mode Manager tests
+    // These exercise ModemUSBConfiguration's mode derivation and
+    // the "only toggle UAC, preserve everything else" transform that
+    // the USB mode management path is built on.
+    // ============================================================
+
+    // A Mac / CellDock configuration (UAC=1) parsed from a real AT response.
+    let macLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,1\r\nOK"
+    let macConfig = try expectNonNil(
+        ATResponseParser.parseUSBConfiguration(macLine),
+        "Mac USBCFG should parse"
+    )
+    try expect(macConfig.vendorID == 0x2C7C, "Mac config vendor ID")
+    try expect(macConfig.productID == 0x0125, "Mac config product ID")
+    try expect(macConfig.audioEnabled == true, "Mac config UAC")
+    try expect(macConfig.usbConnectionMode == .mac, "Mac config derives .mac mode")
+    try expect(macConfig.isCellDockTarget, "Mac config is CellDock target")
+
+    // A Mobile / iPhone configuration (UAC=0).
+    let mobileLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,0\r\nOK"
+    let mobileConfig = try expectNonNil(
+        ATResponseParser.parseUSBConfiguration(mobileLine),
+        "Mobile USBCFG should parse"
+    )
+    try expect(mobileConfig.audioEnabled == false, "Mobile config UAC cleared")
+    try expect(mobileConfig.usbConnectionMode == .mobile, "Mobile config derives .mobile mode")
+
+    // Toggling Mobile → Mac must flip only UAC, preserving all other 8 fields.
+    let macTarget = mobileConfig.switchingUSBMode(to: .mac)
+    try expect(macTarget.audioEnabled == true, "mobile→mac enables UAC")
+    try expect(macTarget.vendorID == mobileConfig.vendorID, "mobile→mac keeps VID")
+    try expect(macTarget.productID == mobileConfig.productID, "mobile→mac keeps PID")
+    try expect(macTarget.diagnosticEnabled == mobileConfig.diagnosticEnabled, "mobile→mac keeps diag")
+    try expect(macTarget.nmeaEnabled == mobileConfig.nmeaEnabled, "mobile→mac keeps nmea")
+    try expect(macTarget.atPortEnabled == mobileConfig.atPortEnabled, "mobile→mac keeps at")
+    try expect(macTarget.modemEnabled == mobileConfig.modemEnabled, "mobile→mac keeps modem")
+    try expect(macTarget.networkEnabled == mobileConfig.networkEnabled, "mobile→mac keeps net")
+    try expect(macTarget.adbEnabled == mobileConfig.adbEnabled, "mobile→mac keeps adb")
+
+    // Toggling Mac → Mobile must flip only UAC.
+    let mobileTarget = macConfig.switchingUSBMode(to: .mobile)
+    try expect(mobileTarget.audioEnabled == false, "mac→mobile clears UAC")
+    try expect(mobileTarget.vendorID == macConfig.vendorID, "mac→mobile keeps VID")
+    try expect(mobileTarget.productID == macConfig.productID, "mac→mobile keeps PID")
+    try expect(mobileTarget.adbEnabled == macConfig.adbEnabled, "mac→mobile keeps adb")
+    try expect(mobileTarget.diagnosticEnabled == macConfig.diagnosticEnabled, "mac→mobile keeps diag")
+    try expect(mobileTarget.nmeaEnabled == macConfig.nmeaEnabled, "mac→mobile keeps nmea")
+    try expect(mobileTarget.atPortEnabled == macConfig.atPortEnabled, "mac→mobile keeps at")
+    try expect(mobileTarget.modemEnabled == macConfig.modemEnabled, "mac→mobile keeps modem")
+    try expect(mobileTarget.networkEnabled == macConfig.networkEnabled, "mac→mobile keeps net")
+
+    // Parse → serialize → parse round-trip preserves all fields.
+    // Simulate the modem echoing the written command back as its USBCFG line.
+    let writtenCommand = macConfig.usbcfgWriteCommand
+    let replyPrefix = "+QCFG: \"usbcfg\","
+    guard writtenCommand.hasPrefix("AT+QCFG=\"USBCFG\",") else {
+        throw SelfTestFailure.failed("writeCommand prefix wrong")
+    }
+    let replyBody = String(writtenCommand.dropFirst("AT+QCFG=\"USBCFG\",".count))
+    let roundTripConfig = try expectNonNil(
+        ATResponseParser.parseUSBConfiguration("\(replyPrefix)\(replyBody)\r\nOK"),
+        "writeCommand round-trip should parse"
+    )
+    try expect(roundTripConfig == macConfig, "mac config round-trips losslessly")
+
+    // Idempotency: switching to the mode you are already in is a no-op result.
+    try expect(mobileConfig.usbConnectionMode == .mobile, "mobile already in .mobile")
+    try expect(macConfig.usbConnectionMode == .mac, "mac already in .mac")
+
+    // Unsupported identity: a non-DJI / non-Quectel VID entirely outside scope.
+    let unsupportedLine = "+QCFG: \"usbcfg\",0x1234,0xABCD,1,1,1,1,1,1,1\r\nOK"
+    let unsupportedConfig = try expectNonNil(
+        ATResponseParser.parseUSBConfiguration(unsupportedLine),
+        "Unsupported USBCFG still parses structurally"
+    )
+    try expect(!(unsupportedConfig.vendorID == 0x2C7C && unsupportedConfig.productID == 0x0125),
+        "Unsupported VID/PID is not a recognized module identity")
+
+    // Malformed / field-count mismatch must not parse (do-not-write safety).
+    let shortLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1\r\nOK"
+    try expect(
+        ATResponseParser.parseUSBConfiguration(shortLine) == nil,
+        "Field-count mismatch must not parse"
+    )
+    let bannedFlag = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,2,1\r\nOK"
+    try expect(
+        ATResponseParser.parseUSBConfiguration(bannedFlag) == nil,
+        "Invalid flag value must not parse"
+    )
+    let missingQCFG = "AT+QCFG=\"usbcfg\"\r\nERROR"
+    try expect(
+        ATResponseParser.parseUSBConfiguration(missingQCFG) == nil,
+        "Response without a +QCFG usbcfg line must not parse"
+    )
+
+
+    // ============================================================
+    // MARK: - Single source-of-truth contract regression
+    // These tests pin the classification contract shared by the UI, the USB
+    // mode controller, and the self-tests: BOTH the DJI-original (audio=1) and
+    // the CellDock-compatible (audio=0) compositions are known-safe and one-click
+    // switchable. The lone free variable is UAC/audio.
+    // ============================================================
+
+    // DJI original / Mac: audio=1.
+    try expect(macConfig.usbProfile == .djiOriginal, "Mac audio=1 was not DJI original profile")
+    try expect(macConfig.knownSafe == true, "Mac audio=1 was not known-safe")
+    try expect(macConfig.oneClickSwitchAllowed == true, "Mac audio=1 did not allow one-click switch")
+    try expect(macConfig.usbConnectionMode == .mac, "Mac audio=1 did not derive .mac")
+    let macReady = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        usbNetMode: 1,
+        usbConfiguration: macConfig
+    )
+    try expect(macReady.initialSetupState == .ready, "Mac audio=1 QDC507 was not reported ready")
+
+    // CellDock compatible / Mobile: audio=0 — the real reported config.
+    try expect(mobileConfig.usbProfile == .cellDockCompatible, "Mobile audio=0 was not CellDock compatible")
+    try expect(mobileConfig.knownSafe == true, "Mobile audio=0 was not known-safe")
+    try expect(mobileConfig.oneClickSwitchAllowed == true, "Mobile audio=0 did not allow one-click switch")
+    try expect(mobileConfig.usbConnectionMode == .mobile, "Mobile audio=0 did not derive .mobile")
+    let mobileReady = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        usbNetMode: 1,
+        usbConfiguration: mobileConfig
+    )
+    try expect(mobileReady.initialSetupState == .ready, "Mobile audio=0 QDC507 was not reported ready")
+    try expect(
+        mobileReady.initialSetupState != .unsupportedUSBConfiguration(
+            mobileReady.usbConfiguration!.compactDescription
+        ),
+        "Mobile audio=0 was rejected as an unsupported USB configuration"
+    )
+    let mobilePanel = ModemModuleStatusPresentation.derive(snapshot: mobileReady)
+    try expect(mobilePanel.configuration == .valid, "Mobile audio=0 was not a valid presentation configuration")
+    try expect(mobilePanel.usbMode == .mobile, "Mobile audio=0 presentation did not map to Mobile mode")
+    try expect(mobilePanel.profile == .cellDockCompatible, "Mobile audio=0 presentation profile mismatch")
+
+    // Mobile -> Mac: only UAC flips, all other fields bit-for-bit identical.
+    let mobileToMac = mobileConfig.switchingUSBMode(to: .mac)
+    try expect(mobileToMac.audioEnabled == true, "mobile->mac did not enable audio")
+    try expect(mobileToMac.vendorID == mobileConfig.vendorID, "mobile->mac VID changed")
+    try expect(mobileToMac.productID == mobileConfig.productID, "mobile->mac PID changed")
+    try expect(mobileToMac.diagnosticEnabled == mobileConfig.diagnosticEnabled, "mobile->mac diag changed")
+    try expect(mobileToMac.nmeaEnabled == mobileConfig.nmeaEnabled, "mobile->mac nmea changed")
+    try expect(mobileToMac.atPortEnabled == mobileConfig.atPortEnabled, "mobile->mac at changed")
+    try expect(mobileToMac.modemEnabled == mobileConfig.modemEnabled, "mobile->mac modem changed")
+    try expect(mobileToMac.networkEnabled == mobileConfig.networkEnabled, "mobile->mac net changed")
+    try expect(mobileToMac.adbEnabled == mobileConfig.adbEnabled, "mobile->mac adb changed")
+
+    // Mac -> Mobile: only UAC flips, all other fields bit-for-bit identical.
+    let macToMobile = macConfig.switchingUSBMode(to: .mobile)
+    try expect(macToMobile.audioEnabled == false, "mac->mobile did not disable audio")
+    try expect(macToMobile.vendorID == macConfig.vendorID, "mac->mobile VID changed")
+    try expect(macToMobile.productID == macConfig.productID, "mac->mobile PID changed")
+    try expect(macToMobile.diagnosticEnabled == macConfig.diagnosticEnabled, "mac->mobile diag changed")
+    try expect(macToMobile.nmeaEnabled == macConfig.nmeaEnabled, "mac->mobile nmea changed")
+    try expect(macToMobile.atPortEnabled == macConfig.atPortEnabled, "mac->mobile at changed")
+    try expect(macToMobile.modemEnabled == macConfig.modemEnabled, "mac->mobile modem changed")
+    try expect(macToMobile.networkEnabled == macConfig.networkEnabled, "mac->mobile net changed")
+    try expect(macToMobile.adbEnabled == macConfig.adbEnabled, "mac->mobile adb changed")
+
+    // Profile classifiers agree with the transforms above.
+    try expect(mobileToMac.usbProfile == .djiOriginal, "mobile->mac target profile was not DJI original")
+    try expect(mobileToMac.knownSafe == true, "mobile->mac target profile was not known-safe")
+    try expect(macToMobile.usbProfile == .cellDockCompatible, "mac->mobile target profile was not CellDock compatible")
+    try expect(macToMobile.knownSafe == true, "mac->mobile target profile was not known-safe")
+
+    // Protected-field changes are never a safe profile and never pass validateDiff.
+    let usbMac = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    let usbMobile = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: false
+    )
+    let usbExec: USBModeController.ATCommandExecutor = { _, _ in ("", 0) }
+    let usbController = USBModeController(executor: usbExec)
+
+    // Only-UAC toggle is the accepted transformation.
+    if case .failure = usbController.validateDiff(from: usbMac, to: usbMobile) {
+        throw SelfTestFailure.failed("only-UAC toggle was rejected by validateDiff")
+    }
+
+    // diag changed -> reject.
+    let usbDiagChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: false,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    if case .success = usbController.validateDiff(from: usbMac, to: usbDiagChanged) {
+        throw SelfTestFailure.failed("diag change was not rejected by validateDiff")
+    }
+
+    // adb changed -> reject.
+    let usbAdbChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: false, uacEnabled: true
+    )
+    if case .success = usbController.validateDiff(from: usbMac, to: usbAdbChanged) {
+        throw SelfTestFailure.failed("adb change was not rejected by validateDiff")
+    }
+
+    // VID changed -> reject.
+    let usbVidChanged = USBConfiguration(
+        vendorID: 0xFFFF, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    if case .success = usbController.validateDiff(from: usbMac, to: usbVidChanged) {
+        throw SelfTestFailure.failed("VID change was not rejected by validateDiff")
+    }
+
+    // PID changed -> reject.
+    let usbPidChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x9999,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    if case .success = usbController.validateDiff(from: usbMac, to: usbPidChanged) {
+        throw SelfTestFailure.failed("PID change was not rejected by validateDiff")
+    }
+
+    // Non-UAC flag changes in the model profile are never legal switchable states.
+    let diagChangedConfig = ModemUSBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        diagnosticEnabled: false, nmeaEnabled: true, atPortEnabled: true,
+        modemEnabled: true, networkEnabled: true, adbEnabled: true, audioEnabled: true
+    )
+    let adbChangedConfig = ModemUSBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        diagnosticEnabled: true, nmeaEnabled: true, atPortEnabled: true,
+        modemEnabled: true, networkEnabled: true, adbEnabled: false, audioEnabled: true
+    )
+    let vidChangedConfig = ModemUSBConfiguration(
+        vendorID: 0xFFFF, productID: 0x0125,
+        diagnosticEnabled: true, nmeaEnabled: true, atPortEnabled: true,
+        modemEnabled: true, networkEnabled: true, adbEnabled: true, audioEnabled: true
+    )
+    let pidChangedConfig = ModemUSBConfiguration(
+        vendorID: 0x2C7C, productID: 0x9999,
+        diagnosticEnabled: true, nmeaEnabled: true, atPortEnabled: true,
+        modemEnabled: true, networkEnabled: true, adbEnabled: true, audioEnabled: true
+    )
+    try expect(diagChangedConfig.usbProfile == .unsupported, "diag=0 profile was not classified as unsupported")
+    try expect(diagChangedConfig.knownSafe == false, "diag=0 profile reported as known-safe")
+    try expect(adbChangedConfig.usbProfile == .unsupported, "adb=0 profile was not classified as unsupported")
+    try expect(adbChangedConfig.knownSafe == false, "adb=0 profile reported as known-safe")
+    try expect(vidChangedConfig.usbProfile == .unsupported, "VID change was not classified as unsupported")
+    try expect(pidChangedConfig.usbProfile == .unsupported, "PID change was not classified as unsupported")
+    try expect(vidChangedConfig.oneClickSwitchAllowed == false, "VID change allowed one-click switch")
+    try expect(pidChangedConfig.oneClickSwitchAllowed == false, "PID change allowed one-click switch")
+
+    // Invalid audio value (2) must not parse.
+    let badAudio = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,2\r\nOK"
+    try expect(
+        ATResponseParser.parseUSBConfiguration(badAudio) == nil,
+        "invalid audio value was parsed as a valid configuration"
+    )
+
+    print("USB mode manager tests passed (derive, only-UAC transform, round-trip, idempotent, unsupported, malformed).")
+}
+
+
+// MARK: - USB composition helpers & crash-recovery regression
+
+do {
+    // A scripted transport that returns a fixed USBCFG read while recording
+    // the last command, so the crash-recovery path can be exercised offline.
+    final class ScriptedTransport: USBModemTransport {
+        var readOutput: (output: String, code: Int32) = ("", 0)
+        var lastCommand = ""
+        func execute(command: String, timeoutMS: Int) -> (output: String, code: Int32) {
+            lastCommand = command
+            if command == USBConfiguration.readCommand {
+                return readOutput
+            }
+            return ("", 0)
+        }
+        func waitForReconnect(timeoutMS: Int) -> Bool { true }
+        var isConnected: Bool { true }
+    }
+
+    let macLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,1\r\n"
+    let mobileLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1,0\r\n"
+    let macConfig = try USBConfiguration.parse(response: macLine).get()
+    let mobileConfig = try USBConfiguration.parse(response: mobileLine).get()
+
+    // --- Composition helpers: protected-field identity and only-UAC diff ---
+
+    // Same protected fields; only UAC differs -> legal switch.
+    try expect(macConfig.hasSameProtectedFields(as: mobileConfig), "original vs mobile protected fields differ")
+    try expect(macConfig.onlyUACChanged(from: mobileConfig), "original vs mobile not only-UAC")
+    try expect(mobileConfig.onlyUACChanged(from: macConfig), "mobile vs original not only-UAC")
+
+    // Identical compositions are NOT an only-UAC change (no UAC delta).
+    try expect(!macConfig.onlyUACChanged(from: macConfig), "identical configs reported as only-UAC")
+    try expect(!mobileConfig.onlyUACChanged(from: mobileConfig), "identical configs reported as only-UAC")
+
+    // Modem hex formatting (0x125 vs 0x0125, lowercase) must not affect identity.
+    let hexVariant = try USBConfiguration.parse(response: "+QCFG: \"usbcfg\",0x2c7c,0x125,1,1,1,1,1,1,1\r\n").get()
+    try expect(macConfig == hexVariant, "hex formatting should not affect equality")
+    try expect(macConfig.hasSameProtectedFields(as: hexVariant), "hex variant protected fields differ")
+    try expect(hexVariant.onlyUACChanged(from: mobileConfig), "hex variant vs mobile should be only-UAC")
+
+    // Protected-field changes break both hasSameProtectedFields and onlyUACChanged.
+    let diagChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: false,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    try expect(!diagChanged.hasSameProtectedFields(as: macConfig), "diag change not detected")
+    try expect(!diagChanged.onlyUACChanged(from: macConfig), "diag change reported as only-UAC")
+
+    let adbChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: false, uacEnabled: true
+    )
+    try expect(!adbChanged.hasSameProtectedFields(as: macConfig), "adb change not detected")
+    try expect(!adbChanged.onlyUACChanged(from: macConfig), "adb change reported as only-UAC")
+
+    let vidChanged = USBConfiguration(
+        vendorID: 0xFFFF, productID: 0x0125,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    try expect(!vidChanged.hasSameProtectedFields(as: macConfig), "VID change not detected")
+    try expect(!vidChanged.onlyUACChanged(from: macConfig), "VID change reported as only-UAC")
+
+    let pidChanged = USBConfiguration(
+        vendorID: 0x2C7C, productID: 0x9999,
+        atEnabled: true, nmeaEnabled: true, diagEnabled: true,
+        modemEnabled: true, reservedFlag: true, adbEnabled: true, uacEnabled: true
+    )
+    try expect(!pidChanged.hasSameProtectedFields(as: macConfig), "PID change not detected")
+
+    // Malformed USBCFG must not parse (field-count mismatch).
+    do {
+        _ = try USBConfiguration.parse(response: "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,1,1\r\n").get()
+        throw SelfTestFailure.failed("field-count mismatch was accepted")
+    } catch USBConfiguration.USBConfigurationError.unsupportedFieldCount {
+        // Expected
+    }
+
+    // --- Crash-recovery regression ---
+
+    func makeBackup(original: USBConfiguration, target: USBConfiguration) -> USBConfigBackup {
+        USBConfigBackup(
+            original: USBConfigBackup.USBConfigSnapshot(original),
+            targetMode: target.uacEnabled ? "mac" : "mobile",
+            targetConfig: USBConfigBackup.USBConfigSnapshot(target),
+            createdAt: Date(),
+            writeStarted: true,
+            verificationCompleted: false
+        )
+    }
+
+    let tmpDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("celldock-usb-recovery-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: tmpDir) }
+
+    // Scenario A — write did not take effect: current == original (audio=1).
+    let transportRestored = ScriptedTransport()
+    transportRestored.readOutput = (macLine, 0)
+    let controllerRestored = USBModeController(transport: transportRestored, backupDirectory: tmpDir)
+    try USBConfigBackupStore.save(makeBackup(original: macConfig, target: mobileConfig), to: tmpDir)
+    try expect(
+        controllerRestored.recoverUnfinishedTransition() == .restored,
+        "crash recovery did not classify current==original as restored"
+    )
+
+    // Scenario B — write succeeded, verification was interrupted: current == desired (audio=0).
+    let transportCompleted = ScriptedTransport()
+    transportCompleted.readOutput = (mobileLine, 0)
+    let controllerCompleted = USBModeController(transport: transportCompleted, backupDirectory: tmpDir)
+    try USBConfigBackupStore.save(makeBackup(original: macConfig, target: mobileConfig), to: tmpDir)
+    try expect(
+        controllerCompleted.recoverUnfinishedTransition() == .completedRecovery,
+        "crash recovery did not classify current==desired as completed"
+    )
+
+    // Scenario C — protected field changed (audio=0 but adb=0): genuine conflict.
+    let conflictLine = "+QCFG: \"usbcfg\",0x2C7C,0x0125,1,1,1,1,0,1,0\r\n"
+    let transportConflict = ScriptedTransport()
+    transportConflict.readOutput = (conflictLine, 0)
+    let controllerConflict = USBModeController(transport: transportConflict, backupDirectory: tmpDir)
+    try USBConfigBackupStore.save(makeBackup(original: macConfig, target: mobileConfig), to: tmpDir)
+    try expect(
+        controllerConflict.recoverUnfinishedTransition() == .conflict,
+        "crash recovery did not flag a protected-field conflict"
+    )
+
+    // Scenario D — hex-formatting tolerance: current reports 0x125 lowercase for
+    // the original composition, which must still be classified as restored.
+    let hexVariantLine = "+QCFG: \"usbcfg\",0x2c7c,0x125,1,1,1,1,1,1,1\r\n"
+    let transportHex = ScriptedTransport()
+    transportHex.readOutput = (hexVariantLine, 0)
+    let controllerHex = USBModeController(transport: transportHex, backupDirectory: tmpDir)
+    try USBConfigBackupStore.save(makeBackup(original: macConfig, target: mobileConfig), to: tmpDir)
+    try expect(
+        controllerHex.recoverUnfinishedTransition() == .restored,
+        "crash recovery did not tolerate modem hex formatting"
+    )
+
+    print("USB composition & crash-recovery tests passed (hasSameProtectedFields, onlyUACChanged, recoverUnfinishedTransition).")
+}
+
+// MARK: - Connection / recovery engine regression matrix
+
+do {
+    let base = Date(timeIntervalSince1970: 1_800_000_000)
+    let supportedUSB = ModemUSBConfiguration.maVoTarget
+    let mobileUSB = ModemUSBConfiguration(
+        vendorID: 0x2C7C,
+        productID: 0x0125,
+        diagnosticEnabled: true,
+        nmeaEnabled: true,
+        atPortEnabled: true,
+        modemEnabled: true,
+        networkEnabled: true,
+        adbEnabled: true,
+        audioEnabled: false
+    )
+
+    func modem(
+        state: ModemConnectionState = .connected,
+        lifecycle: ModemLifecyclePhase = .normal,
+        sim: SIMState = .ready,
+        registration: CellularRegistrationState = .registered,
+        usb: ModemUSBConfiguration? = supportedUSB
+    ) -> ModemSnapshot {
+        ModemSnapshot(
+            state: state,
+            lifecyclePhase: lifecycle,
+            usbIdentity: state == .disconnected ? nil : "2C7C:0125",
+            operatorName: "China Unicom",
+            accessTechnology: "LTE",
+            signalDBm: -92,
+            simState: sim,
+            registrationState: registration,
+            usbNetMode: state == .connected ? 1 : nil,
+            usbConfiguration: usb
+        )
+    }
+
+    func activeNetwork(internet: Bool? = true) -> CellularNetworkStatus {
+        CellularNetworkStatus(
+            serviceID: "cellular-test",
+            bsdName: "en7",
+            isEnabled: true,
+            isActive: true,
+            isLinkActive: true,
+            isHardwarePresent: true,
+            ipv4Address: "192.168.225.25",
+            ipv4Router: "192.168.225.1",
+            internetReachable: internet
+        )
+    }
+
+    func readyObservation(
+        usb: ModemUSBConfiguration = supportedUSB,
+        internet: Bool? = true
+    ) -> ModemConnectionObservation {
+        ModemConnectionObservation(
+            usbDetected: true,
+            modem: modem(usb: usb),
+            network: activeNetwork(internet: internet),
+            internetReachable: internet
+        )
+    }
+
+    // Test 1 — Cold Plug.
+    var coldPlug = ModemConnectionStateMachine()
+    try expect(
+        coldPlug.observe(ModemConnectionObservation(
+            usbDetected: false,
+            modem: ModemSnapshot()
+        ), now: base).stage == .disconnected,
+        "Cold Plug did not start disconnected"
+    )
+    _ = coldPlug.beginRecovery(trigger: .coldPlug, now: base)
+    try expect(
+        coldPlug.observe(ModemConnectionObservation(
+            usbDetected: true,
+            modem: ModemSnapshot()
+        ), now: base.addingTimeInterval(1)).stage == .waitingForAT,
+        "Cold Plug did not wait for delayed AT"
+    )
+    try expect(
+        coldPlug.observe(ModemConnectionObservation(
+            usbDetected: true,
+            modem: modem(registration: .searching),
+            network: CellularNetworkStatus()
+        ), now: base.addingTimeInterval(4)).stage == .registeringNetwork,
+        "Cold Plug skipped the registration wait"
+    )
+    try expect(
+        coldPlug.observe(readyObservation(), now: base.addingTimeInterval(10)).stage == .connected,
+        "Cold Plug did not reach connected"
+    )
+
+    // Test 2 — AT Delayed with bounded retries.
+    var atDelayed = ModemConnectionStateMachine()
+    let atSession = atDelayed.beginRecovery(trigger: .coldPlug, now: base)
+    for attempt in 0 ..< 4 {
+        let state = atDelayed.observe(ModemConnectionObservation(
+            usbDetected: true,
+            modem: modem(state: .connecting, sim: .initializing, registration: .unavailable)
+        ), now: base.addingTimeInterval(Double(attempt)))
+        try expect(state.stage == .waitingForAT, "AT delay became a terminal failure too early")
+        atDelayed.recordRecoveryAttempt(level: .refresh)
+    }
+    try expect(atDelayed.isCurrentSession(atSession), "AT delayed session was replaced")
+    try expect(
+        atDelayed.observe(readyObservation(), now: base.addingTimeInterval(8)).stage == .connected,
+        "AT delayed recovery did not succeed"
+    )
+
+    // Test 3 — SIM Missing must not collapse into network failure.
+    var simMissing = ModemConnectionStateMachine()
+    let simMissingStatus = simMissing.observe(ModemConnectionObservation(
+        usbDetected: true,
+        modem: modem(sim: .absent, registration: .unavailable),
+        network: CellularNetworkStatus()
+    ), now: base)
+    try expect(
+        simMissingStatus.stage == .failed && simMissingStatus.failure == .simMissing,
+        "SIM Missing was not classified independently"
+    )
+
+    // Test 4 — Registration Delay.
+    var registrationDelay = ModemConnectionStateMachine()
+    for offset in [0.0, 30.0, 60.0] {
+        let state = registrationDelay.observe(ModemConnectionObservation(
+            usbDetected: true,
+            modem: modem(registration: .searching),
+            network: CellularNetworkStatus()
+        ), now: base.addingTimeInterval(offset))
+        try expect(state.stage == .registeringNetwork, "Searching registration failed too early")
+    }
+    try expect(
+        registrationDelay.observe(
+            readyObservation(),
+            now: base.addingTimeInterval(70)
+        ).stage == .connected,
+        "Registration delay did not recover"
+    )
+
+    // Test 5 — USB Disconnect / Reconnect.
+    var reconnect = ModemConnectionStateMachine()
+    _ = reconnect.beginRecovery(trigger: .coldPlug, now: base)
+    _ = reconnect.observe(readyObservation(), now: base.addingTimeInterval(1))
+    let disconnected = reconnect.observe(ModemConnectionObservation(
+        usbDetected: false,
+        modem: ModemSnapshot()
+    ), now: base.addingTimeInterval(2))
+    try expect(
+        disconnected.stage == .waitingForModuleReboot,
+        "connected USB loss was treated as an immediate fatal error"
+    )
+    _ = reconnect.beginRecovery(trigger: .usbReconnect, now: base.addingTimeInterval(3))
+    _ = reconnect.observe(ModemConnectionObservation(
+        usbDetected: true,
+        modem: modem(state: .connecting, sim: .initializing, registration: .unavailable)
+    ), now: base.addingTimeInterval(4))
+    try expect(
+        reconnect.observe(readyObservation(), now: base.addingTimeInterval(9)).stage == .connected,
+        "USB reconnect did not return to connected"
+    )
+
+    // Test 6 — Module Reboot.
+    var reboot = ModemConnectionStateMachine()
+    _ = reboot.beginRecovery(trigger: .coldPlug, now: base)
+    _ = reboot.observe(readyObservation(), now: base.addingTimeInterval(1))
+    reboot.markDisconnected(now: base.addingTimeInterval(2), expectedReboot: true)
+    try expect(
+        reboot.status.stage == .waitingForModuleReboot && reboot.status.isRecovering,
+        "module reboot did not enter its grace state"
+    )
+    _ = reboot.observe(ModemConnectionObservation(
+        usbDetected: true,
+        modem: modem(
+            state: .connecting,
+            lifecycle: .reconnecting,
+            sim: .initializing,
+            registration: .unavailable
+        )
+    ), now: base.addingTimeInterval(5))
+    try expect(
+        reboot.observe(readyObservation(), now: base.addingTimeInterval(10)).stage == .connected,
+        "module reboot did not reconnect"
+    )
+
+    // Test 7 — Sleep / Wake.
+    var sleepWake = ModemConnectionStateMachine()
+    _ = sleepWake.beginRecovery(trigger: .coldPlug, now: base)
+    _ = sleepWake.observe(readyObservation(), now: base.addingTimeInterval(1))
+    sleepWake.markSleep(now: base.addingTimeInterval(2))
+    try expect(
+        sleepWake.observe(ModemConnectionObservation(
+            usbDetected: false,
+            modem: ModemSnapshot()
+        ), now: base.addingTimeInterval(3)).stage == .waitingForEnumeration,
+        "sleep USB loss was treated as permanent"
+    )
+    _ = sleepWake.markWake(now: base.addingTimeInterval(4))
+    try expect(
+        sleepWake.observe(readyObservation(), now: base.addingTimeInterval(11)).stage == .connected &&
+            sleepWake.status.recoveredAfterWake,
+        "wake recovery did not complete"
+    )
+
+    // Test 8 — Concurrent recovery triggers coalesce into one session.
+    var concurrent = ModemConnectionStateMachine()
+    let wakeSession = concurrent.beginRecovery(trigger: .systemWake, now: base)
+    let usbSession = concurrent.beginRecovery(trigger: .usbReconnect, now: base)
+    let healthSession = concurrent.beginRecovery(trigger: .healthCheckFailure, now: base)
+    try expect(
+        wakeSession == usbSession && usbSession == healthSession &&
+            concurrent.status.coalescedTriggers == 2,
+        "concurrent recovery created more than one active session"
+    )
+
+    // Test 9 — Recovery may read USBCFG but must never mutate it.
+    let originalUSBConfiguration = mobileUSB
+    try expect(
+        ModemRecoveryPolicy.automaticATCommands.allSatisfy {
+            !ModemRecoveryPolicy.changesPersistentConfiguration($0)
+        },
+        "automatic recovery contains a persistent AT command"
+    )
+    try expect(
+        !ModemRecoveryPolicy.actions(for: .refresh).contains(.requestUserConfiguration) &&
+            !ModemRecoveryPolicy.actions(for: .softRecover).contains(.requestUserConfiguration),
+        "automatic recovery crossed into persistent user-action policy"
+    )
+    var preservation = ModemConnectionStateMachine()
+    _ = preservation.beginRecovery(trigger: .usbReconnect, now: base)
+    try expect(
+        preservation.observe(
+            readyObservation(usb: originalUSBConfiguration),
+            now: base.addingTimeInterval(8)
+        ).stage == .connected &&
+            originalUSBConfiguration == mobileUSB,
+        "USB configuration changed during recovery"
+    )
+
+    let sensitiveModem = ModemSnapshot(
+        state: .connected,
+        usbIdentity: "2C7C:0125",
+        operatorName: "China Unicom",
+        accessTechnology: "LTE",
+        signalDBm: -92,
+        simState: .ready,
+        registrationState: .registered,
+        simPhoneNumber: "13800138000",
+        simICCID: "89860312345678901234",
+        simIMSI: "460011234567890",
+        moduleIMEI: "867530900000001",
+        usbNetMode: 1,
+        usbConfiguration: supportedUSB
+    )
+    let diagnostics = ModemConnectionDiagnosticsReport.make(
+        status: preservation.status,
+        modem: sensitiveModem,
+        network: activeNetwork(),
+        appVersion: "test",
+        timestamp: base
+    )
+    try expect(
+        !diagnostics.contains("13800138000") &&
+            !diagnostics.contains("89860312345678901234") &&
+            !diagnostics.contains("460011234567890") &&
+            !diagnostics.contains("867530900000001"),
+        "connection diagnostics exposed SIM or device identity"
+    )
+
+    print("Connection recovery tests passed (cold plug, delayed AT/registration, SIM, reconnect, reboot, wake, concurrency, USB preservation, diagnostics).")
+}
+
+// MARK: - SMSManager regression tests
+
+do {
+    let manager = SMSManager()
+
+    // Build helper SMSMessage instances.
+    let firstSMS = SMSMessage(
+        id: "sms-a",
+        modemIndices: [],
+        sender: "10086",
+        body: "您的验证码为 123456",
+        timestamp: Date(timeIntervalSince1970: 1_700_002_000),
+        rawPDUs: [],
+        isRead: false,
+        firstSeenAt: Date(timeIntervalSince1970: 1_700_002_000)
+    )
+    let secondSMS = SMSMessage(
+        id: "sms-b",
+        modemIndices: [],
+        sender: "BANK",
+        body: "订单号 482913 已发货",
+        timestamp: Date(timeIntervalSince1970: 1_700_002_100),
+        rawPDUs: [],
+        isRead: false,
+        firstSeenAt: Date(timeIntervalSince1970: 1_700_002_100)
+    )
+
+    // 1. Single message appears once.
+    let firstMirrors = manager.ingest([firstSMS])
+    try expect(firstMirrors.count == 1, "first SMS was not mirrored")
+    try expect(manager.messages.count == 1, "SMSManager did not retain the first message")
+    try expect(manager.messages.first?.sender == "10086", "SMSManager lost the sender")
+
+    // 2. Duplicate ingest does not duplicate.
+    let secondRound = manager.ingest([firstSMS])
+    try expect(secondRound.isEmpty, "duplicate SMS was re-emitted by SMSManager")
+    try expect(manager.messages.count == 1, "duplicate SMS was re-stored by SMSManager")
+
+    // 3. Different message is appended.
+    let thirdRound = manager.ingest([secondSMS])
+    try expect(thirdRound.count == 1, "second SMS was not mirrored")
+    try expect(manager.messages.count == 2, "second SMS was not retained")
+    try expect(manager.messages.first?.sender == "BANK", "newest message should be first")
+
+    // 4. Multipart: once assembled by the PDU pipeline, the merged message
+    // enters SMSManager exactly once with the assembled body.
+    let assembledMultipart = SMSMessage(
+        id: "multipart-1",
+        modemIndices: [1, 2],
+        sender: "10086",
+        body: "验证码为 123456",
+        timestamp: Date(timeIntervalSince1970: 1_700_003_000),
+        rawPDUs: [],
+        isRead: false,
+        firstSeenAt: Date(timeIntervalSince1970: 1_700_003_000)
+    )
+    let multipartRound = manager.ingest([assembledMultipart, assembledMultipart])
+    try expect(multipartRound.count == 1, "assembled multipart SMS entered SMSManager more than once")
+    try expect(manager.messages.first?.body == "验证码为 123456", "multipart body was not the assembled text")
+
+    // 5. History limit of 100.
+    let bulkManager = SMSManager()
+    var bulk: [SMSMessage] = []
+    for i in 0..<150 {
+        bulk.append(SMSMessage(
+            id: "bulk-\(i)",
+            modemIndices: [],
+            sender: "Sender \(i)",
+            body: "Body \(i)",
+            timestamp: Date(timeIntervalSince1970: 1_700_004_000 + TimeInterval(i)),
+            rawPDUs: [],
+            isRead: false,
+            firstSeenAt: Date(timeIntervalSince1970: 1_700_004_000 + TimeInterval(i))
+        ))
+    }
+    _ = bulkManager.ingest(bulk)
+    try expect(
+        bulkManager.messages.count == SMSManager.historyLimit,
+        "SMSManager exceeded history limit"
+    )
+    try expect(
+        bulkManager.messages.first?.body == "Body 149",
+        "SMSManager did not keep the newest message after truncation"
+    )
+
+    // 7. replaceMessages() replaces the list and resets dedup state.
+    manager.clear()
+    try expect(manager.messages.isEmpty, "clear() did not empty SMSManager")
+    let afterClear = manager.ingest([firstSMS])
+    try expect(afterClear.count == 1, "message was not re-accepted after clear")
+
+    // 7. replaceMessages() replaces the list and resets dedup state.
+    let replacement = ModemSMSMessage(
+        sender: "NEW",
+        timestamp: Date(timeIntervalSince1970: 1_700_005_000),
+        body: "replacement",
+        receivedAt: Date(timeIntervalSince1970: 1_700_005_000)
+    )
+    manager.replaceMessages([replacement])
+    try expect(manager.messages.count == 1, "replaceMessages did not set the list")
+    try expect(manager.messages.first?.body == "replacement", "replaceMessages wrong content")
+    let afterReplace = manager.ingest([firstSMS])
+    try expect(afterReplace.count == 1, "replaceMessages did not reset dedup state")
+
+    print("SMSManager tests passed (ingest, dedup, multipart, limit, clear, replace).")
 }

@@ -44,6 +44,10 @@ swiftc \
   "$ROOT/Sources/CellDockNetworkIPC/CellDockNetworkIPC.swift" \
   "$ROOT/Sources/CellDockNetworkHelper/NetworkHelperState.swift" \
   "$ROOT/Sources/CellDock/Models.swift" \
+  "$ROOT/Sources/CellDock/ModemConnectionRecovery.swift" \
+  "$ROOT/Sources/CellDock/ModemRecoveryEngine.swift" \
+  "$ROOT/Sources/CellDock/ModemPowerManager.swift" \
+  "$ROOT/Sources/CellDock/ModemModuleStatusPresentation.swift" \
   "$ROOT/Sources/CellDock/QADBKeyDeriver.swift" \
   "$ROOT/Sources/CellDock/MessageConversation.swift" \
   "$ROOT/Sources/CellDock/CellularLinkRecovery.swift" \
@@ -54,16 +58,22 @@ swiftc \
   "$ROOT/Sources/CellDock/ATResponseParser.swift" \
   "$ROOT/Sources/CellDock/SMSPDUDecoder.swift" \
   "$ROOT/Sources/CellDock/SMSPDUEncoder.swift" \
+  "$ROOT/Sources/CellDock/SMSManager.swift" \
   "$ROOT/Sources/CellDock/SMSVerificationCode.swift" \
   "$ROOT/Sources/CellDock/SOCKSProtocol.swift" \
   "$ROOT/Sources/CellDock/BoundSocket.swift" \
+  "$ROOT/Sources/CellDock/CellularInternetProbe.swift" \
   "$ROOT/Sources/CellDock/SOCKSDNSResolver.swift" \
   "$ROOT/Sources/CellDock/SOCKSProxyModels.swift" \
   "$ROOT/Sources/CellDock/VoWiFiRuntimeModels.swift" \
   "$ROOT/Sources/CellDock/VoWiFiRuntimeControl.swift" \
   "$ROOT/Sources/CellDock/VoWiFiUpstreamProxyModels.swift" \
   "$ROOT/Sources/CellDock/VerificationMessageAutoDelete.swift" \
+  "$ROOT/Sources/CellDock/USBConfiguration.swift" \
+  "$ROOT/Sources/CellDock/USBModeController.swift" \
+  "$ROOT/Sources/CellDock/USBConfigBackup.swift" \
   "$ROOT/Tests/SelfTests/main.swift" \
+  -framework AppKit \
   -o "$ROOT/.build/self-tests/CellDockSelfTests"
 
 "$ROOT/.build/self-tests/CellDockSelfTests"

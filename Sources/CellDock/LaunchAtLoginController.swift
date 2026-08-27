@@ -1,5 +1,21 @@
 import Foundation
 
+enum CellDockLaunchContext {
+    static let backgroundConnectionServiceArgument = "--background-connection-service"
+
+    static var isBackgroundConnectionService: Bool {
+        isBackgroundConnectionService(arguments: CommandLine.arguments)
+    }
+
+    static func isBackgroundConnectionService(arguments: [String]) -> Bool {
+        arguments.contains(backgroundConnectionServiceArgument)
+    }
+
+    static func shouldShowInitialWindow(arguments: [String]) -> Bool {
+        !isBackgroundConnectionService(arguments: arguments)
+    }
+}
+
 enum LaunchAtLoginStatus: Equatable {
     case disabled
     case enabled
@@ -67,12 +83,21 @@ struct LaunchAtLoginController {
     func migrateLegacyRegistrationIfNeeded() throws {
         let legacyPropertyListURL = launchAgentsDirectory
             .appendingPathComponent("\(Self.legacyLabel).plist")
-        guard fileManager.fileExists(atPath: legacyPropertyListURL.path) else { return }
+        if fileManager.fileExists(atPath: legacyPropertyListURL.path) {
+            let legacyServiceTarget = "\(domainTarget)/\(Self.legacyLabel)"
+            _ = runLaunchctl(["bootout", legacyServiceTarget])
+            try fileManager.removeItem(at: legacyPropertyListURL)
+            if status != .enabled {
+                try installAndBootstrap()
+            }
+        }
 
-        let legacyServiceTarget = "\(domainTarget)/\(Self.legacyLabel)"
-        _ = runLaunchctl(["bootout", legacyServiceTarget])
-        try fileManager.removeItem(at: legacyPropertyListURL)
-        if status != .enabled {
+        // Existing CellDock registrations created before background recovery
+        // did not include the background-only launch argument. Upgrade them in
+        // place so login startup remains enabled without opening a window.
+        if isAvailable,
+           fileManager.fileExists(atPath: propertyListURL.path),
+           !configurationMatchesCurrentApplication {
             try installAndBootstrap()
         }
     }
@@ -90,7 +115,10 @@ struct LaunchAtLoginController {
     static func propertyList(appBundlePath: String) -> [String: Any] {
         [
             "Label": label,
-            "ProgramArguments": ["/usr/bin/open", "-g", appBundlePath],
+            "ProgramArguments": [
+                "/usr/bin/open", "-g", appBundlePath, "--args",
+                CellDockLaunchContext.backgroundConnectionServiceArgument,
+            ],
             "RunAtLoad": true,
             "LimitLoadToSessionType": "Aqua",
             "ProcessType": "Interactive",
@@ -110,7 +138,8 @@ struct LaunchAtLoginController {
               let propertyList = object as? [String: Any],
               propertyList["Label"] as? String == Self.label,
               propertyList["ProgramArguments"] as? [String] == [
-                  "/usr/bin/open", "-g", applicationURL.path,
+                  "/usr/bin/open", "-g", applicationURL.path, "--args",
+                  CellDockLaunchContext.backgroundConnectionServiceArgument,
               ],
               propertyList["RunAtLoad"] as? Bool == true else {
             return false

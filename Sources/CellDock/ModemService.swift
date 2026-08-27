@@ -1,5 +1,6 @@
 import CModemBridge
 import Foundation
+import OSLog
 
 struct EUICCATResponse {
     let output: String
@@ -45,6 +46,51 @@ func celldockModemStreamCallback(
 }
 
 final class ModemService {
+    private static let log = Logger(subsystem: "app.celldock.mac", category: "USBConfig")
+
+    private static func diagnosticCommand(_ value: String) -> String {
+        let command = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return command.uppercased().hasPrefix("ATD") ? "ATD<redacted>;" : command
+    }
+
+    private static func diagnosticModemText(_ text: String) -> String {
+        ATResponseParser.normalizedLines(text).map { line in
+            let uppercase = line.uppercased()
+            if uppercase.hasPrefix("ATD") { return "ATD<redacted>;" }
+            if uppercase.hasPrefix("+CLIP:") { return "+CLIP: <redacted>" }
+            if uppercase.hasPrefix("+COLP:") { return "+COLP: <redacted>" }
+            if uppercase.hasPrefix("+CMT:") { return "+CMT: <redacted>" }
+            if uppercase.hasPrefix("+CNUM:") { return "+CNUM: <redacted>" }
+            if uppercase.hasPrefix("+QCCID:") { return "+QCCID: <redacted>" }
+            if uppercase.hasPrefix("+CCID:") { return "+CCID: <redacted>" }
+            if uppercase.hasPrefix("+CLCC:"),
+               let info = CallATParser.parseCLCC(line) {
+                return "+CLCC: index=\(info.index),direction=\(info.direction.rawValue),status=\(info.status.rawValue),voice=\(info.isVoice)"
+            }
+            if line.count >= 14, line.allSatisfy({ $0.isHexDigit }) {
+                return "<redacted hex payload \(line.count / 2) bytes>"
+            }
+            return line
+        }.joined(separator: " | ")
+    }
+
+    private static func diagnosticCallEvent(_ event: ModemCallEvent) -> String {
+        switch event {
+        case .ring:
+            return "ring"
+        case .callerID:
+            return "callerID=<redacted>"
+        case let .callInfo(info):
+            return "callInfo(index=\(info.index),direction=\(info.direction.rawValue),status=\(info.status.rawValue))"
+        case .connected:
+            return "connected"
+        case let .ended(reason):
+            return "ended(reason=\(reason.rawValue))"
+        case let .pcmFlowReady(ready):
+            return "pcmFlowReady=\(ready)"
+        }
+    }
+
     var onSnapshot: ((ModemSnapshot) -> Void)?
     var onMessages: (([SMSMessage], Bool) -> Void)?
     var onCallSnapshot: ((CallSnapshot) -> Void)?
@@ -65,7 +111,10 @@ final class ModemService {
         let modemGeneration: UInt64
         let registryID: UInt64
         let direction: CallDirection
-        let preferredUACUID: String
+        /// Optional UAC device UID. The QDC507 firmware carries VoLTE PCM over
+        /// its f_audio gadget (not USB Audio Class), so this is nil for that
+        /// path and media is routed via `celldock_voice` PCM instead.
+        let preferredUACUID: String?
         var callIndex: Int?
     }
 
@@ -118,6 +167,7 @@ final class ModemService {
     private var expectedRestartStartedAt: Date?
     private var expectedRestartObservedDisconnect = false
     private var isRunning = false
+    private var backgroundWorkPaused = false
     private var currentMessageStorage: String?
     private var readableMessageStorages: [String] = []
     private var observedMessageStorages: Set<String> = []
@@ -151,12 +201,18 @@ final class ModemService {
     private var isShuttingDown = false
     private var qdcInitializationRetryGeneration: UInt64 = 0
     private var qdcInitializationRetryAttempts = 0
+    private var usbDetectedByInventory = false
+    private var connectionProbeAttempts = 0
+    private var nextConnectionProbeAt = Date.distantPast
+    private var nextRadioRefreshAt = Date.distantPast
+    private static let connectionProbeRetryDelays: [TimeInterval] = [1, 2, 3, 5]
 
     init(locationID: UInt32? = nil) {
         preferredLocationID = locationID
         voiceAudio.onError = { [weak self] error in
             self?.queue.async {
                 guard let self else { return }
+                Self.log.info("[CALL] voiceAudio.onError: \(error, privacy: .public) audioActive=\(self.callSnapshot.audioActive)")
                 self.callSnapshot.audioActive = false
                 self.callSnapshot.lastError = error
                 self.publishCallSnapshot()
@@ -293,6 +349,51 @@ final class ModemService {
             self.needsImmediateMessagePoll = true
             self.needsSIMRefresh = true
             self.tickNumber = 9
+            self.tick()
+        }
+    }
+
+    func setUSBDetected(_ detected: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let changed = self.usbDetectedByInventory != detected
+            self.usbDetectedByInventory = detected
+            if detected, changed {
+                self.connectionProbeAttempts = 0
+                self.nextConnectionProbeAt = .distantPast
+                Self.log.info("[Recovery] USB inventory attached; probing transport")
+                self.tick()
+            } else if !detected {
+                self.connectionProbeAttempts = 0
+                self.nextConnectionProbeAt = .distantPast
+            }
+        }
+    }
+
+    /// Refreshes only the connection health chain. It does not force a message
+    /// sync or modify any persistent modem setting.
+    func refreshConnectionHealth() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.nextRadioRefreshAt = .distantPast
+            if self.snapshot.simState != .ready { self.needsSIMRefresh = true }
+            self.tick()
+        }
+    }
+
+    /// Starts a fresh bounded AT/transport probe cycle on the existing C bridge.
+    /// No second USB handle or serial implementation is created.
+    func requestConnectionRecovery() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.connectionProbeAttempts = 0
+            self.nextConnectionProbeAt = .distantPast
+            if self.usbDetectedByInventory, !self.isOpen {
+                self.snapshot.state = .connecting
+                self.snapshot.lifecyclePhase = .reconnecting
+                self.snapshot.lastError = nil
+                self.publishSnapshot(self.snapshot)
+            }
             self.tick()
         }
     }
@@ -1222,7 +1323,12 @@ final class ModemService {
                 return
             }
 
-            if !currentConfiguration.isCellDockTarget {
+            // Only rewrite the USBCFG when the module is not already a legal
+            // QDC507 composition. A QDC507 that has merely had its USB audio/
+            // UAC flag turned off (CellDock-compatible, audio=0) must never be
+            // rewritten back to audio=1 here — it is already a valid profile,
+            // so we skip the USBCFG write and only handle usbnet below.
+            if !currentConfiguration.isRecognizedQDC507Profile {
                 let targetCommand = ModemUSBConfiguration.maVoTarget.usbcfgWriteCommand
                 let write = self.command(targetCommand, timeout: 8_000)
                 if write.isTransportAmbiguous {
@@ -1476,74 +1582,93 @@ final class ModemService {
         }
     }
 
+    /// Places a QDC507 outbound call with ATD first and UAC media bring-up second.
+    ///
+    /// Call control and audio media are decoupled: the module can dial over its AT
+    /// channel even when the UAC media path is not yet ready. We therefore issue
+    /// `ATD` up front, then best-effort validate/bind the UAC device so the media
+    /// route can start once the call reaches active CLCC. If the UAC device is not
+    /// reachable at dial time (e.g. QPCMV=1,2 applied but USB gadget still
+    /// re-enumerating), the call is still placed; `startQDCMediaIfNeeded` will skip
+    /// audio until a media session exists, and the UI reports "音频未就绪".
     private func beginQDCOutgoingCall(
         _ number: String,
         token: CallActionToken,
         completion: @escaping (ModemActionResult) -> Void
     ) {
-        guard let modem, moduleVoiceRuntime != nil else {
+        guard let modem else {
             failCallSetup(
-                .failure(L10n.tr("QDC507 UAC 通话运行时未初始化。")),
+                .failure(L10n.tr("模块已断开，无法拨号。")),
                 completion: completion
             )
             return
         }
-        let vendorID = celldock_modem_vendor_id(modem)
-        let productID = celldock_modem_product_id(modem)
-        voiceAudio.validateUAC(
-            vendorID: vendorID,
-            productID: productID,
-            matchingLocationID: modemLocationID
-        ) { [weak self] validation in
-            guard let self else { return }
-            self.queue.async {
-                guard self.isCurrentCallAction(token),
-                      self.callSnapshot.phase == .dialing,
-                      self.isOpen else {
-                    self.invalidateCallAction()
-                    DispatchQueue.main.async {
-                        completion(.failure(L10n.tr("UAC 预检期间模块或通话状态已改变。")))
-                    }
-                    return
-                }
-                guard case let .success(uid?) = validation, !uid.isEmpty else {
-                    let error: String
-                    if case let .failure(message) = validation {
-                        error = message
-                    } else {
-                        error = L10n.tr("UAC 预检没有返回可绑定的设备 UID。")
-                    }
-                    self.failCallSetup(.failure(error), completion: completion)
-                    return
-                }
-
-                let mediaSession = self.makePendingQDCMediaSession(
-                    direction: .outgoing,
-                    preferredUACUID: uid
+        let dial = self.callCommand("ATD\(number);", timeout: 12_000)
+        guard dial.isSuccess else {
+            if dial.isTransportAmbiguous {
+                self.reconcileAmbiguousQDCStart(
+                    mediaSession: nil,
+                    completion: completion
                 )
-                let dial = self.callCommand("ATD\(number);", timeout: 12_000)
-                guard dial.isSuccess else {
-                    if dial.isTransportAmbiguous {
-                        self.reconcileAmbiguousQDCStart(
-                            mediaSession: mediaSession,
-                            completion: completion
-                        )
-                        return
-                    }
-                    self.cancelPendingQDCMediaSession()
-                    self.failCallSetup(
-                        .failure(dial.error ?? self.callFailureMessage(from: dial.output)),
-                        completion: completion
-                    )
-                    return
-                }
-                self.invalidateCallAction()
-                self.callSnapshot.audioActive = false
-                self.callStateChangedAt = Date()
-                self.publishCallSnapshot()
-                DispatchQueue.main.async { completion(.success(L10n.tr("正在拨号…"))) }
-                self.queue.async { [weak self] in self?.refreshCallState() }
+                return
             }
+            self.failCallSetup(
+                .failure(dial.error ?? self.callFailureMessage(from: dial.output)),
+                completion: completion
+            )
+            return
+        }
+        self.invalidateCallAction()
+        self.callSnapshot.audioActive = false
+        self.callStateChangedAt = Date()
+        self.publishCallSnapshot()
+        DispatchQueue.main.async { completion(.success(L10n.tr("正在拨号…"))) }
+
+        // Best-effort UAC media binding — never blocks the dial result. Runs only
+        // when both the ADB helper runtime and the 8 kHz UAC device are present so
+        // an eager media session can start at active CLCC.
+        guard let runtime = moduleVoiceRuntime else {
+            Self.log.info("[CALL] QDC ATD sent without media runtime; waiting for active CLCC")
+            self.queue.async { [weak self] in self?.refreshCallState() }
+            return
+        }
+        self.bindQDCMediaSessionIfAvailable(
+            direction: .outgoing,
+            runtime: runtime,
+            modem: modem
+        )
+    }
+
+    /// Creates a pending media session for an actively ring/dialing QDC call so
+    /// `startQDCMediaIfNeeded` can bring up the VoLTE PCM bridge once the call
+    /// reaches active CLCC.
+    ///
+    /// The QDC507 customized firmware carries VoLTE PCM over the module's
+    /// `f_audio` gadget / `ttyGS0` and never exposes a standard USB Audio Class
+    /// device. So this must NOT probe for a UAC device (that probe always fails
+    /// on this firmware and left the call silent). Instead we bind a session for
+    /// any live call in this direction, and `startQDCMediaIfNeeded` brings up the
+    /// module-side f_audio route plus the Mac-side `celldock_voice` PCM stream.
+    private func bindQDCMediaSessionIfAvailable(
+        direction: CallDirection,
+        runtime: ModuleVoiceRuntime,
+        modem: OpaquePointer
+    ) {
+        queue.async { [weak self] in
+            guard let self, self.isOpen else { return }
+            // Only bind while a call in this direction is still active; otherwise
+            // drop so the UI does not claim audio it never started.
+            guard self.callSnapshot.direction == direction, self.callSnapshot.hasCall else {
+                self.cancelPendingQDCMediaSession()
+                return
+            }
+            let session = self.makePendingQDCMediaSession(
+                direction: direction,
+                preferredUACUID: nil
+            )
+            self.pendingQDCMediaSession = session
+            Self.log.info("[CALL] QDC media session bound for \(direction.rawValue, privacy: .public)")
+            self.refreshCallState()
         }
     }
 
@@ -1551,80 +1676,51 @@ final class ModemService {
         token: CallActionToken,
         completion: @escaping (ModemActionResult) -> Void
     ) {
-        guard let modem, moduleVoiceRuntime != nil else {
+        guard let modem else {
             failCallSetup(
-                .failure(L10n.tr("QDC507 UAC 通话运行时未初始化。")),
+                .failure(L10n.tr("模块已断开，无法接听。")),
                 completion: completion,
                 preserveIncoming: true
             )
             return
         }
-        let vendorID = celldock_modem_vendor_id(modem)
-        let productID = celldock_modem_product_id(modem)
-        voiceAudio.validateUAC(
-            vendorID: vendorID,
-            productID: productID,
-            matchingLocationID: modemLocationID
-        ) { [weak self] validation in
-            guard let self else { return }
-            self.queue.async {
-                guard self.isCurrentCallAction(token),
-                      self.callSnapshot.phase == .incoming,
-                      self.isOpen else {
-                    self.invalidateCallAction()
-                    DispatchQueue.main.async {
-                        completion(.failure(L10n.tr("UAC 预检期间来电或模块状态已改变。")))
-                    }
-                    return
-                }
-                guard case let .success(uid?) = validation, !uid.isEmpty else {
-                    let error: String
-                    if case let .failure(message) = validation {
-                        error = message
-                    } else {
-                        error = L10n.tr("UAC 预检没有返回可绑定的设备 UID。")
-                    }
-                    self.failCallSetup(
-                        .failure(error),
-                        completion: completion,
-                        preserveIncoming: true
-                    )
-                    return
-                }
-
-                let mediaSession = self.makePendingQDCMediaSession(
-                    direction: .incoming,
-                    preferredUACUID: uid
+        let answer = self.callCommand("ATA", timeout: 12_000)
+        guard answer.isSuccess else {
+            if answer.isTransportAmbiguous {
+                self.reconcileAmbiguousQDCStart(
+                    mediaSession: nil,
+                    completion: completion
                 )
-                let answer = self.callCommand("ATA", timeout: 12_000)
-                guard answer.isSuccess else {
-                    if answer.isTransportAmbiguous {
-                        self.reconcileAmbiguousQDCStart(
-                            mediaSession: mediaSession,
-                            completion: completion
-                        )
-                        return
-                    }
-                    self.cancelPendingQDCMediaSession()
-                    self.failCallSetup(
-                        .failure(answer.error ?? self.callFailureMessage(from: answer.output)),
-                        completion: completion,
-                        preserveIncoming: true
-                    )
-                    return
-                }
-                self.invalidateCallAction()
-                self.callSnapshot.audioActive = false
-                self.callStateChangedAt = Date()
-                self.publishCallSnapshot()
-                DispatchQueue.main.async { completion(.success(L10n.tr("正在接通…"))) }
-                self.queue.async { [weak self] in self?.refreshCallState() }
+                return
             }
+            self.failCallSetup(
+                .failure(answer.error ?? self.callFailureMessage(from: answer.output)),
+                completion: completion,
+                preserveIncoming: true
+            )
+            return
         }
+        self.invalidateCallAction()
+        self.callSnapshot.audioActive = false
+        self.callStateChangedAt = Date()
+        self.publishCallSnapshot()
+        DispatchQueue.main.async { completion(.success(L10n.tr("正在接通…"))) }
+
+        // Best-effort UAC media binding — never blocks the answer result.
+        guard let runtime = moduleVoiceRuntime else {
+            Self.log.info("[CALL] QDC ATA sent without media runtime")
+            self.queue.async { [weak self] in self?.refreshCallState() }
+            return
+        }
+        self.bindQDCMediaSessionIfAvailable(
+            direction: .incoming,
+            runtime: runtime,
+            modem: modem
+        )
     }
 
     private func reconcileAmbiguousQDCStart(
-        mediaSession: PendingQDCMediaSession,
+        mediaSession: PendingQDCMediaSession?,
         completion: @escaping (ModemActionResult) -> Void
     ) {
         callSnapshot.phase = .recovering
@@ -1632,9 +1728,15 @@ final class ModemService {
         publishCallSnapshot()
         switch queryCallPresence() {
         case let .present(calls):
-            guard let primary = calls.first(where: {
-                $0.direction == mediaSession.direction
-            }) else {
+            let primary: ModemCallInfo?
+            if let mediaSession {
+                primary = calls.first(where: { $0.direction == mediaSession.direction })
+            } else if let first = calls.first {
+                primary = first
+            } else {
+                primary = nil
+            }
+            guard let primary else {
                 cancelPendingQDCMediaSession()
                 failCallSetup(
                     .failure(L10n.tr("CLCC 中没有找到本次通话。")),
@@ -1676,7 +1778,7 @@ final class ModemService {
 
     private func makePendingQDCMediaSession(
         direction: CallDirection,
-        preferredUACUID: String
+        preferredUACUID: String?
     ) -> PendingQDCMediaSession {
         qdcMediaSessionID &+= 1
         qdcMediaStartInFlight = false
@@ -1720,23 +1822,57 @@ final class ModemService {
     }
 
     private func startQDCMediaIfNeeded(for info: ModemCallInfo) {
-        guard callMediaBackend == .qdcUAC,
-              info.status == .active,
-              !callSnapshot.audioActive,
-              !voiceAudio.isRunning,
-              !pcmSessionEnabled,
-              !qdcMediaStartInFlight,
-              var session = pendingQDCMediaSession,
-              session.direction == info.direction,
-              isCurrentQDCMediaSession(session),
-              let runtime = moduleVoiceRuntime,
-              let modem else {
+        guard callMediaBackend == .qdcUAC else {
+            Self.log.info("[CALL] media skip: backend=\(String(describing: self.callMediaBackend), privacy: .public) != qdcUAC")
+            return
+        }
+        guard info.status == .active else {
+            Self.log.info("[CALL] media skip: status=\(info.status.rawValue) != active")
+            return
+        }
+        guard !callSnapshot.audioActive else {
+            Self.log.info("[CALL] media skip: audio already active")
+            return
+        }
+        guard !voiceAudio.isRunning else {
+            Self.log.info("[CALL] media skip: voice audio already running")
+            return
+        }
+        guard !pcmSessionEnabled else {
+            Self.log.info("[CALL] media skip: pcm session already enabled")
+            return
+        }
+        guard !qdcMediaStartInFlight else {
+            Self.log.info("[CALL] media skip: media start already in flight")
+            return
+        }
+        guard var session = pendingQDCMediaSession else {
+            Self.log.info("[CALL] media skip: no pending media session")
+            return
+        }
+        guard session.direction == info.direction else {
+            Self.log.info("[CALL] media skip: session direction=\(session.direction.rawValue, privacy: .public) != call direction=\(info.direction.rawValue, privacy: .public)")
+            return
+        }
+        guard isCurrentQDCMediaSession(session) else {
+            Self.log.info("[CALL] media skip: session not current (gen/registry changed)")
+            return
+        }
+        guard let runtime = moduleVoiceRuntime else {
+            Self.log.info("[CALL] media skip: moduleVoiceRuntime is nil")
+            return
+        }
+        guard let modem else {
+            Self.log.info("[CALL] media skip: modem handle is nil")
             return
         }
         if let callIndex = session.callIndex, callIndex != info.index { return }
         session.callIndex = info.index
         pendingQDCMediaSession = session
-        guard activeCallMatches(session) else { return }
+        guard activeCallMatches(session) else {
+            Self.log.info("[CALL] media skip: activeCallMatches failed (CLCC lookup did not yield matching active call)")
+            return
+        }
 
         qdcMediaStartInFlight = true
         pcmSessionEnabled = true
@@ -1757,17 +1893,30 @@ final class ModemService {
             return
         }
 
+        Self.log.info("[CALL] media: module f_audio route started; binding 8 kHz USB Audio device")
         let vendorID = celldock_modem_vendor_id(modem)
         let productID = celldock_modem_product_id(modem)
+        // The QDC507 firmware's f_audio route (startRouteOnly above) sets
+        // audio_enable=1, which makes the module re-enumerate a standard 8 kHz
+        // USB Audio Class device (AC interface = module->Mac capture, AS interface
+        // = Mac->module playback, seen as "EG25G-QDC507" / BAIWANG). Binding that
+        // UAC device with startUAC() is the correct media path. The earlier
+        // attempt to read the PCM via celldock_voice on interface 6 failed because
+        // interface 6 is already held exclusively by the ADB control transport.
+        let mediaLocationID = modemLocationID
         voiceAudio.startUAC(
             vendorID: vendorID,
             productID: productID,
-            matchingLocationID: modemLocationID,
+            matchingLocationID: mediaLocationID,
             preferredUID: session.preferredUACUID
         ) { [weak self] result in
             guard let self else { return }
             self.queue.async {
-                guard self.isCurrentQDCMediaSession(session) else { return }
+                guard self.isCurrentQDCMediaSession(session) else {
+                    Self.log.info("[CALL] media: startUAC completion dropped (session no longer current; modemGeneration=\(self.modemGeneration) sessionGen=\(session.modemGeneration))")
+                    self.qdcMediaStartInFlight = false
+                    return
+                }
                 self.qdcMediaStartInFlight = false
                 switch result {
                 case .success:
@@ -1778,13 +1927,15 @@ final class ModemService {
                         )
                         return
                     }
+                    Self.log.info("[CALL] media: CoreAudio bridge up; audioActive=true")
                     self.voiceAudio.setMediaEnabled(true)
                     self.callSnapshot.audioActive = true
                     self.callSnapshot.lastError = nil
                     self.publishCallSnapshot()
                 case let .failure(message):
+                    Self.log.info("[CALL] media: startUAC FAILED: \(message, privacy: .public)")
                     self.handleQDCMediaStartFailure(
-                        L10n.tr("QDC507 UAC 启动失败：%@", message),
+                        L10n.tr("QDC507 通话音频启动失败：%@", message),
                         session: session
                     )
                 }
@@ -2381,10 +2532,11 @@ final class ModemService {
     }
 
     private func tick() {
-        guard let modem else { return }
+        guard !backgroundWorkPaused, let modem else { return }
         tickNumber += 1
 
         if !isOpen {
+            guard Date() >= nextConnectionProbeAt else { return }
             if let expectedRestartStartedAt,
                !expectedRestartObservedDisconnect,
                Date().timeIntervalSince(expectedRestartStartedAt) < 2 {
@@ -2393,6 +2545,7 @@ final class ModemService {
             }
             let wasRecoveringCall = callSnapshot.hasCall || hasPendingMediaCleanup
             let result: Int32
+            Self.log.info("helper running=true USB transport open requested preferredLocation=\(self.preferredLocationID ?? 0, privacy: .public) recoveringCall=\(wasRecoveringCall, privacy: .public)")
             if wasRecoveringCall {
                 guard modemLocationID != 0 else {
                     callSnapshot.phase = .recovering
@@ -2407,6 +2560,15 @@ final class ModemService {
                 result = celldock_modem_open(modem)
             }
             if result == CELLDOCK_MODEM_OK {
+                connectionProbeAttempts = 0
+                nextConnectionProbeAt = .distantPast
+                let usbIdentity = String(
+                    format: "%04X:%04X",
+                    celldock_modem_vendor_id(modem),
+                    celldock_modem_product_id(modem)
+                )
+                let usbLocation = String(format: "0x%08X", celldock_modem_location_id(modem))
+                Self.log.info("transport open success VID/PID=\(usbIdentity, privacy: .public) interface count=\(celldock_modem_interface_count(modem), privacy: .public) location=\(usbLocation, privacy: .public)")
                 if let expectedRestartStartedAt,
                    !expectedRestartObservedDisconnect,
                    Date().timeIntervalSince(expectedRestartStartedAt) < 5 {
@@ -2442,6 +2604,7 @@ final class ModemService {
                 }
                 if !isOpen { return }
             } else {
+                Self.log.warning("transport open failure code=\(result, privacy: .public) error=\(self.lastBridgeError(), privacy: .public)")
                 resetSMSConnectionState()
                 if isExpectingModuleRestart {
                     expectedRestartObservedDisconnect = true
@@ -2457,6 +2620,14 @@ final class ModemService {
                     )
                     publishSnapshot(snapshot)
                     return
+                }
+                if usbDetectedByInventory,
+                   scheduleConnectionProbeRetry(error: lastBridgeError()) {
+                    return
+                }
+                if !usbDetectedByInventory {
+                    connectionProbeAttempts = 0
+                    nextConnectionProbeAt = .distantPast
                 }
                 if result == CELLDOCK_MODEM_NOT_FOUND,
                    callSnapshot.phase != .unavailable,
@@ -2521,7 +2692,7 @@ final class ModemService {
             refreshCallState()
             return
         }
-        if tickNumber.isMultiple(of: 10) {
+        if Date() >= nextRadioRefreshAt {
             refreshRadioSnapshot()
         }
         if needsSIMRefresh || Date() >= nextSIMRefreshAt {
@@ -2621,6 +2792,90 @@ final class ModemService {
         }
     }
 
+    /// Re-applies the UAC voice function only for Quectel QDC507/EG25-G firmware.
+    ///
+    /// Other modules (e.g. standard EC25) use the classic `AT+QPCMV=1,0` raw-PCM
+    /// path and must not be switched to `1,2`. This gate keeps the non-persistent
+    /// UAC bring-up scoped to the customized firmware that actually needs it.
+    @discardableResult
+    private func ensureUACVoiceFunctionIfQDC(firmwareIdentity: String) -> Bool {
+        guard CallATParser.isQDCVoiceFirmware(firmwareIdentity) else {
+            return false
+        }
+        return ensureUACVoiceFunction()
+    }
+
+    /// Ensures the module's USB Audio Class (UAC) voice function is enabled.
+    ///
+    /// Per Quectel's EC2x/EG9x "Voice Over USB and UAC" Application Note the
+    /// UAC voice function is toggled with `AT+QPCMV=1,2`. This setting is *not*
+    /// persisted by the module: it resets to the default after every restart,
+    /// re-enumeration, `AT+CFUN=1,1`, or USB mode switch. So it must be re-applied
+    /// on every fresh modem session rather than once.
+    ///
+    /// The write is only meaningful once the module has re-enumerated with the
+    /// USBCFG UAC bit enabled (audio=1). `USBCFG` itself is persistent and has
+    /// already been confirmed saved, so this function never rewrites it.
+    ///
+    /// Returns `true` only when the module reports an active UAC voice function
+    /// (`+QPCMV: 1,2`). On failure it records the live capability/identity reads
+    /// so the QDC507 customized-firmware support can be assessed without retrying
+    /// in a tight loop.
+    @discardableResult
+    private func ensureUACVoiceFunction() -> Bool {
+        guard isOpen else { return false }
+
+        let query = command("AT+QPCMV?", timeout: 3_000)
+        let alreadyEnabled = query.isSuccess &&
+            ATResponseParser.normalizedLines(query.output)
+                .map { $0.replacingOccurrences(of: " ", with: "") }
+                .contains("+QPCMV:1,2")
+        if alreadyEnabled {
+            Self.log.info("[UAC] QPCMV already active (1,2)")
+            return true
+        }
+
+        let enable = command("AT+QPCMV=1,2", timeout: 3_000)
+        guard enable.isSuccess else {
+            recordUACCapabilityDiagnostics()
+            return false
+        }
+
+        // The write acknowledged OK. Re-read to confirm the module accepted it.
+        let confirm = command("AT+QPCMV?", timeout: 3_000)
+        let confirmed = confirm.isSuccess &&
+            ATResponseParser.normalizedLines(confirm.output)
+                .map { $0.replacingOccurrences(of: " ", with: "") }
+                .contains("+QPCMV:1,2")
+        if confirmed {
+            Self.log.info("[UAC] QPCMV=1,2 enabled")
+        } else {
+            Self.log.warning("[UAC] QPCMV=1,2 accepted but re-read did not confirm")
+            recordUACCapabilityDiagnostics()
+        }
+        return confirmed
+    }
+
+    /// Records the live identity/capability reads that let us judge whether a QDC507
+    /// customized firmware supports the UAC path. Never sends a write here.
+    private func recordUACCapabilityDiagnostics() {
+        let ati = command("ATI", timeout: 3_000)
+        let qgmr = command("AT+QGMR", timeout: 3_000)
+        let qpcmvCapability = command("AT+QPCMV=?", timeout: 3_000)
+        let qpcmv = command("AT+QPCMV?", timeout: 3_000)
+        let usbcfg = command("AT+QCFG=\"USBCFG\"", timeout: 3_000)
+        let atiText = Self.diagnosticModemText(ati.output)
+        Self.log.info("[UAC] diag ATI=\(atiText, privacy: .public)")
+        let qgmrText = Self.diagnosticModemText(qgmr.output)
+        Self.log.info("[UAC] diag QGMR=\(qgmrText, privacy: .public)")
+        let qpcmvCapText = Self.diagnosticModemText(qpcmvCapability.output)
+        Self.log.info("[UAC] diag QPCMV?=\(qpcmvCapText, privacy: .public)")
+        let qpcmvText = Self.diagnosticModemText(qpcmv.output)
+        Self.log.info("[UAC] diag QPCMV=\(qpcmvText, privacy: .public)")
+        let usbcfgText = Self.diagnosticModemText(usbcfg.output)
+        Self.log.info("[UAC] diag USBCFG=\(usbcfgText, privacy: .public)")
+    }
+
     private func initializeConnectedModem() {
         guard let modem else { return }
         let isRestartReconnect = expectedRestartStartedAt != nil
@@ -2643,21 +2898,30 @@ final class ModemService {
         publishSnapshot(snapshot)
 
         let handshake = command("AT", timeout: 2_000)
+        let handshakeError = handshake.error ?? "none"
+        Self.log.info("AT probe result=\(handshake.isSuccess, privacy: .public) code=\(handshake.code, privacy: .public) error=\(handshakeError, privacy: .public)")
         guard handshake.isSuccess else {
+            celldock_modem_close(modem)
+            resetSMSConnectionState()
             if isExpectingModuleRestart {
                 snapshot.state = .connecting
                 snapshot.lifecyclePhase = .reconnecting
                 snapshot.lastError = nil
+            } else if usbDetectedByInventory,
+                      scheduleConnectionProbeRetry(
+                          error: handshake.error ?? L10n.tr("AT 接口没有响应")
+                      ) {
+                return
             } else {
                 clearExpectedModuleRestart()
                 snapshot.state = .error
                 snapshot.lastError = handshake.error ?? L10n.tr("AT 接口没有响应")
             }
             publishSnapshot(snapshot)
-            celldock_modem_close(modem)
-            resetSMSConnectionState()
             return
         }
+        connectionProbeAttempts = 0
+        nextConnectionProbeAt = .distantPast
 
         _ = command("ATE0", timeout: 2_000)
         _ = command("AT+CMEE=2", timeout: 2_000)
@@ -2680,12 +2944,33 @@ final class ModemService {
         var mediaError: String?
         var shouldRetryQDCInitialization = false
         moduleVoiceRuntime = nil
+
+        // Quectel EC2x/EG9x Voice Over USB and UAC: after the USBCFG UAC bit is
+        // set (audio=1, persistent), the module must be told to enable its UAC
+        // voice function via AT+QPCMV=1,2 on every fresh AT session, because this
+        // setting is *not* persisted — it resets to default after restart,
+        // re-enumeration, CFUN=1,1 or USB-mode switch. We therefore run it here,
+        // before backend selection, whenever the firmware identity is QDC507/EG25-G
+        // and regardless of how the media backend is later classified. This keeps
+        // the UAC voice function active across App start, plug/unplug, CFUN reboot,
+        // USB-mode switch, Recovery re-discovery and Mac sleep/wake re-init.
+        _ = ensureUACVoiceFunctionIfQDC(firmwareIdentity: firmwareIdentity)
+
         switch CallATParser.preferredMediaBackend(
             firmwareIdentity: firmwareIdentity,
             supportsRawPCM: supportsRawPCM,
             hasUSBLocation: modemLocationID != 0
         ) {
         case .qdcModuleBridge:
+            // AT call control (ATD/ATA/ATH) is independent of UAC/media readiness:
+            // a QDC507 with its AT channel up, SIM ready and network registered can
+            // place and receive calls even before the UAC audio path is usable. We
+            // therefore never degrade callMediaBackend to .none merely because the
+            // auxiliary ADB helper/media route is not yet ready — that would block
+            // dialing. Below, a *best-effort* UAC/media bring-up runs; on any
+            // failure we still keep .qdcUAC so the phone model can dial/answer/hang
+            // up and surface "音频未就绪" rather than "无法拨号".
+            var mediaInitError: String?
             do {
                 let runtime = try ModuleVoiceRuntime(locationID: modemLocationID)
                 _ = try runtime.prepare()
@@ -2694,12 +2979,15 @@ final class ModemService {
                 // unplug while the module kept external power.
                 try runtime.stopBridge()
                 moduleVoiceRuntime = runtime
-                callMediaBackend = .qdcUAC
-                mediaAvailable = true
             } catch {
-                callMediaBackend = .none
-                mediaError = L10n.error("QDC507 通话组件尚不可用：%@", underlying: error)
+                mediaInitError = L10n.error("QDC507 通话组件尚不可用：%@", underlying: error)
                 shouldRetryQDCInitialization = ADBModuleController.isInterfaceBusyError(error)
+            }
+            // Keep the call-control backend stable even if media bring-up failed.
+            callMediaBackend = .qdcUAC
+            mediaAvailable = mediaInitError == nil
+            if let mediaInitError {
+                mediaError = mediaInitError
             }
         case .qpcmv:
             let reset = command("AT+QPCMV=0", timeout: 3_000)
@@ -2714,12 +3002,17 @@ final class ModemService {
             callMediaBackend = .none
         }
         pcmSessionEnabled = false
+        // The phone control state must not collapse to .unavailable just
+        // because the UAC/media path is not yet ready. For a QDC507/EG25-G the
+        // AT channel is the call-control surface: AT ready + SIM ready +
+        // network registered is enough to dial/answer/hang up. Audio readiness
+        // is a separate concern surfaced via voiceOverUSBSupported / lastError.
         callSnapshot = CallSnapshot(
-            phase: mediaAvailable ? .idle : .unavailable,
+            phase: .idle,
             voiceOverUSBSupported: mediaAvailable,
             lastError: mediaAvailable
                 ? nil
-                : (mediaError ?? L10n.tr("固件未报告可用的 USB 通话媒体通道。")),
+                : (mediaError ?? L10n.tr("通话控制可用；本机音频媒体尚未就绪。")),
             controlInterfaceBusy: shouldRetryQDCInitialization
         )
         publishCallSnapshot()
@@ -2744,7 +3037,20 @@ final class ModemService {
         let usbNet = command("AT+QCFG=\"usbnet\"", timeout: 3_000)
         snapshot.usbNetMode = ATResponseParser.parseUSBNetMode(usbNet.output)
         let usbConfiguration = command("AT+QCFG=\"USBCFG\"", timeout: 3_000)
-        snapshot.usbConfiguration = ATResponseParser.parseUSBConfiguration(usbConfiguration.output)
+        if let parsed = ATResponseParser.parseUSBConfiguration(usbConfiguration.output) {
+            snapshot.usbConfiguration = parsed
+            // Diagnostic profile log — never includes ICCID/IMSI/auth keys.
+            switch parsed.usbProfile {
+            case .djiOriginal:
+                Self.log.info("USBConfig detected profile=djiOriginal UAC/audio=enabled AT=\(parsed.atPortEnabled, privacy: .public) NET=\(parsed.networkEnabled, privacy: .public) ADB=\(parsed.adbEnabled, privacy: .public)")
+            case .cellDockCompatible:
+                Self.log.info("USBConfig detected profile=cellDockCompatible UAC/audio=disabled (expected) AT=\(parsed.atPortEnabled, privacy: .public) NET=\(parsed.networkEnabled, privacy: .public) ADB=\(parsed.adbEnabled, privacy: .public)")
+            case .unsupported:
+                Self.log.warning("USBConfig detected profile=unsupported identity=\(parsed.identity, privacy: .public)")
+            }
+        } else {
+            Self.log.warning("USBConfig failed to parse USBCFG response")
+        }
         let ims = command("AT+QCFG=\"ims\"", timeout: 3_000)
         snapshot.imsMode = ATResponseParser.parseIMSMode(ims.output)
         snapshot.volteSessionAvailable = ATResponseParser.parseVoLTESessionAvailable(ims.output)
@@ -2950,7 +3256,34 @@ final class ModemService {
             return
         }
         snapshot.state = .connected
+        nextRadioRefreshAt = Date().addingTimeInterval(
+            snapshot.registrationState.hasService ? 30 : 3
+        )
         publishSnapshot(snapshot)
+    }
+
+    @discardableResult
+    private func scheduleConnectionProbeRetry(error: String) -> Bool {
+        guard Self.connectionProbeRetryDelays.indices.contains(connectionProbeAttempts) else {
+            connectionProbeAttempts = 0
+            nextConnectionProbeAt = Date().addingTimeInterval(15)
+            Self.log.error(
+                "[Recovery] AT retry budget exhausted stage=waitingForAT underlying=\(error, privacy: .public)"
+            )
+            return false
+        }
+        let delay = Self.connectionProbeRetryDelays[connectionProbeAttempts]
+        connectionProbeAttempts += 1
+        nextConnectionProbeAt = Date().addingTimeInterval(delay)
+        snapshot.state = .connecting
+        snapshot.lifecyclePhase = .reconnecting
+        snapshot.simState = .initializing
+        snapshot.lastError = nil
+        Self.log.notice(
+            "[Recovery] Waiting for AT attempt=\(self.connectionProbeAttempts) retryIn=\(delay, format: .fixed(precision: 1))s underlying=\(error, privacy: .public)"
+        )
+        publishSnapshot(snapshot)
+        return true
     }
 
     private func pollMessages() {
@@ -2988,7 +3321,7 @@ final class ModemService {
     }
 
     private func pumpUnsolicitedEvents() {
-        guard isOpen else { return }
+        guard !backgroundWorkPaused, isOpen else { return }
         consumeURCBytes(readPendingEvents(timeout: 5))
     }
 
@@ -3005,11 +3338,21 @@ final class ModemService {
 
     private func consumeURCBytes(_ text: String, acceptsCallInfo: Bool = true) {
         guard !text.isEmpty else { return }
+        let diagnosticText = Self.diagnosticModemText(text)
+        Self.log.info("[MODEM RX] \(diagnosticText, privacy: .public)")
         for event in callURCFramer.consume(text) {
             if !acceptsCallInfo, case .callInfo = event { continue }
+            Self.log.info("[URC] \(Self.diagnosticCallEvent(event), privacy: .public)")
             handleCallEvent(event)
         }
         let batch = urcFramer.consume(text)
+        if !batch.messageLocations.isEmpty ||
+            !batch.directPDUs.isEmpty ||
+            !batch.textModeCMTs.isEmpty {
+            Self.log.info(
+                "[SMS] locations=\(batch.messageLocations.count) directPDUs=\(batch.directPDUs.count) textModeCMTs=\(batch.textModeCMTs.count)"
+            )
+        }
         for location in batch.messageLocations {
             observedMessageStorages.insert(location.storage)
             enqueueMessageLocation(location)
@@ -3048,6 +3391,12 @@ final class ModemService {
     }
 
     private func handleCallEvent(_ event: ModemCallEvent) {
+        let previousPhase = callSnapshot.phase
+        defer {
+            Self.log.info(
+                "[CALL] event=\(Self.diagnosticCallEvent(event), privacy: .public) phase=\(previousPhase.rawValue, privacy: .public)->\(self.callSnapshot.phase.rawValue, privacy: .public)"
+            )
+        }
         switch event {
         case .ring:
             if callSnapshot.phase == .idle || callSnapshot.phase == .unavailable {
@@ -3091,6 +3440,7 @@ final class ModemService {
     }
 
     private func applyCallInfo(_ info: ModemCallInfo) {
+        let previousPhase = callSnapshot.phase
         callSnapshot.direction = info.direction
         if let number = info.number, !number.isEmpty {
             callSnapshot.number = number
@@ -3108,6 +3458,9 @@ final class ModemService {
         }
         callStateChangedAt = Date()
         callPollMisses = 0
+        Self.log.info(
+            "[CALL] source=CLCC index=\(info.index) status=\(info.status.rawValue) direction=\(info.direction.rawValue, privacy: .public) phase=\(previousPhase.rawValue, privacy: .public)->\(self.callSnapshot.phase.rawValue, privacy: .public)"
+        )
         publishCallSnapshot()
         if info.status == .active {
             startQDCMediaIfNeeded(for: info)
@@ -3379,6 +3732,8 @@ final class ModemService {
             commandStreamAcceptsCallInfo = true
             commandInFlight = false
         }
+        let diagnosticCommand = Self.diagnosticCommand(value)
+        Self.log.info("[MODEM TX] \(diagnosticCommand, privacy: .public)")
         var buffer = [CChar](repeating: 0, count: capacity)
         let result: Int32 = buffer.withUnsafeMutableBufferPointer { pointer in
             if acceptsCallResults {
@@ -3399,6 +3754,10 @@ final class ModemService {
             )
         }
         let output = String(cString: buffer)
+        let diagnosticOutput = Self.diagnosticModemText(output)
+        Self.log.info(
+            "[MODEM RX] command=\(diagnosticCommand, privacy: .public) code=\(result) response=\(diagnosticOutput, privacy: .public)"
+        )
         let terminalError = ATResponseParser.normalizedLines(output).first { line in
             let uppercase = line.uppercased()
             if uppercase == "ERROR" || uppercase.hasPrefix("+CME ERROR:") || uppercase.hasPrefix("+CMS ERROR:") {
@@ -3412,6 +3771,88 @@ final class ModemService {
         return CommandResult(output: output, code: result, error: error)
     }
 
+    /// Read the current USB composition configuration from the modem.
+    /// Returns `nil` if the modem is disconnected, the command fails, or the
+    /// response cannot be parsed.
+    func readUSBConfiguration(timeoutMS: Int = 5000) -> USBConfiguration? {
+        let result = command(USBConfiguration.readCommand, timeout: timeoutMS)
+        guard result.code == 0 else { return nil }
+        return try? USBConfiguration.parse(response: result.output).get()
+    }
+
+    func previewUSBMode() -> ModemUSBConfiguration? {
+        guard isOpen, modem != nil else { return nil }
+        let result = command("AT+QCFG=\"USBCFG\"", timeout: 3_000)
+        guard result.code == 0 else { return nil }
+        return ATResponseParser.parseUSBConfiguration(result.output)
+    }
+
+    func switchUSBMode(
+        to target: USBConnectionMode,
+        completion: @escaping (ModemActionResult) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self, self.isOpen, self.modem != nil else {
+                DispatchQueue.main.async { completion(.failure(L10n.tr("请先插入 DJI 4G 模块。"))) }
+                return
+            }
+            // Step 1 — Read current USBCFG.
+            let readResult = self.command("AT+QCFG=\"USBCFG\"", timeout: 3_000)
+            guard readResult.code == 0,
+                  let current = ATResponseParser.parseUSBConfiguration(readResult.output) else {
+                DispatchQueue.main.async { completion(.failure(L10n.tr("无法读取当前 USB 配置，未执行切换。"))) }
+                return
+            }
+            // Idempotency — already in the target mode.
+            if current.usbConnectionMode == target {
+                let message = target == .mac
+                    ? L10n.tr("已在 Mac / CellDock 模式（UAC=1），无需切换。")
+                    : L10n.tr("已处于 iPhone / Mobile 模式（UAC=0），无需切换。")
+                DispatchQueue.main.async { completion(.success(message)) }
+                return
+            }
+            // Step 2 — Build target from the *real* current fields, flipping only UAC.
+            let desired = current.switchingUSBMode(to: target)
+            // Step 3 — Write the transformed configuration.
+            let writeResult = self.command(desired.usbcfgWriteCommand, timeout: 8_000)
+            guard writeResult.code == 0 else {
+                DispatchQueue.main.async {
+                    completion(.failure(L10n.tr("写入模块超时或失败，未切换 USB 模式。")))
+                }
+                return
+            }
+            // Step 4 — Read back and verify only UAC changed.
+            let readbackResult = self.command("AT+QCFG=\"USBCFG\"", timeout: 3_000)
+            guard readbackResult.code == 0,
+                  let actual = ATResponseParser.parseUSBConfiguration(readbackResult.output) else {
+                DispatchQueue.main.async {
+                    completion(.failure(L10n.tr("切换后无法回读 USB 配置，验证失败，未视为成功。")))
+                }
+                return
+            }
+            guard actual.audioEnabled == desired.audioEnabled,
+                  actual.vendorID == current.vendorID,
+                  actual.productID == current.productID,
+                  actual.diagnosticEnabled == current.diagnosticEnabled,
+                  actual.nmeaEnabled == current.nmeaEnabled,
+                  actual.atPortEnabled == current.atPortEnabled,
+                  actual.modemEnabled == current.modemEnabled,
+                  actual.networkEnabled == current.networkEnabled,
+                  actual.adbEnabled == current.adbEnabled else {
+                DispatchQueue.main.async {
+                    completion(.failure(L10n.tr("切换后回读校验失败：检测到除 UAC 外的字段发生变化，未视为成功。")))
+                }
+                return
+            }
+            self.snapshot.usbConfiguration = actual
+            let message = target == .mac
+                ? L10n.tr("已切换到 Mac / CellDock 模式（UAC=1），其余 USB 字段保持不变。")
+                : L10n.tr("已切换到 iPhone / Mobile 模式（UAC=0），其余 USB 字段保持不变。")
+            DispatchQueue.main.async { completion(.success(message)) }
+        }
+    }
+
+
     private func lastBridgeError() -> String {
         guard let modem, let pointer = celldock_modem_last_error(modem) else {
             return L10n.tr("未知的 USB/AT 错误")
@@ -3422,6 +3863,9 @@ final class ModemService {
 
     private func publishSnapshot(_ value: ModemSnapshot) {
         guard lastPublishedSnapshot != value else { return }
+        if lastPublishedSnapshot?.isConnected != value.isConnected {
+            Self.log.info("moduleConnected \(self.lastPublishedSnapshot?.isConnected ?? false, privacy: .public) → \(value.isConnected, privacy: .public)")
+        }
         lastPublishedSnapshot = value
         DispatchQueue.main.async { [weak self] in
             self?.onSnapshot?(value)
@@ -3441,6 +3885,90 @@ final class ModemService {
         lastPublishedCallFingerprint = fingerprint
         DispatchQueue.main.async { [weak self] in
             self?.onCallSnapshot?(value)
+        }
+    }
+
+    // MARK: - Power management
+
+    func setPowerManagementBackgroundWorkPaused(_ paused: Bool) {
+        queue.async { [weak self] in
+            self?.backgroundWorkPaused = paused
+        }
+    }
+
+    /// Diagnostic AT bridge for the USB-mode test surface. Mirrors
+    /// `executePowerManagementAT`: serializes onto the modem queue, runs the
+    /// command through the existing AT channel, and delivers the *raw* modem
+    /// output plus the bridge return code on the main queue. Adds no new AT
+    /// vocabulary — callers supply commands from the already-verified set.
+    func executeDiagnosticAT(
+        _ commandText: String,
+        timeoutMS: Int,
+        completion: @escaping (_ output: String, _ code: Int32) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self, self.isOpen else {
+                DispatchQueue.main.async { completion("", Int32(CELLDOCK_MODEM_NOT_OPEN)) }
+                return
+            }
+            let result = self.command(commandText, timeout: timeoutMS)
+            DispatchQueue.main.async { completion(result.output, result.code) }
+        }
+    }
+
+    /// Whether the underlying AT port is currently open. Used by the USB-mode
+    /// test transport to detect that the module survived (or came back after)
+    /// a USBCFG write without inventing a new discovery path.
+    var isATPortOpen: Bool { isOpen }
+
+    func executePowerManagementAT(
+        _ command: ModemPowerATCommand,
+        timeoutMS: Int,
+        completion: @escaping (ModemPowerCommandResponse) -> Void
+    ) {
+        queue.async { [weak self] in
+            guard let self, self.isOpen else {
+                DispatchQueue.main.async {
+                    completion(ModemPowerCommandResponse(
+                        outcome: .notOpen,
+                        output: "",
+                        elapsedMS: 0
+                    ))
+                }
+                return
+            }
+
+            let startedAt = DispatchTime.now().uptimeNanoseconds
+            let result = self.command(command.rawValue, timeout: timeoutMS)
+            let finishedAt = DispatchTime.now().uptimeNanoseconds
+            let elapsedMS = finishedAt >= startedAt
+                ? Int((finishedAt - startedAt) / 1_000_000)
+                : 0
+            let outcome: ModemPowerCommandOutcome
+            if result.code == 0 {
+                let lines = ATResponseParser.normalizedLines(result.output)
+                    .map { $0.uppercased() }
+                outcome = lines.contains(where: {
+                    $0 == "ERROR" ||
+                        $0.hasPrefix("+CME ERROR:") ||
+                        $0.hasPrefix("+CMS ERROR:")
+                }) ? .error : .ok
+            } else if result.code == Int32(CELLDOCK_MODEM_NOT_OPEN) {
+                outcome = .notOpen
+            } else if result.error?.localizedCaseInsensitiveContains("timed out") == true ||
+                        result.error?.localizedCaseInsensitiveContains("timeout") == true {
+                outcome = .timeout
+            } else {
+                outcome = .error
+            }
+
+            DispatchQueue.main.async {
+                completion(ModemPowerCommandResponse(
+                    outcome: outcome,
+                    output: result.output,
+                    elapsedMS: elapsedMS
+                ))
+            }
         }
     }
 }

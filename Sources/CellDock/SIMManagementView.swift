@@ -554,6 +554,11 @@ struct SIMManagementView: View {
         )
     }
 
+    private var selectedRecoveryStatus: ModemRecoveryStatus? {
+        guard selectedModule?.id == appState.primaryDataModuleID else { return nil }
+        return appState.modemRecoveryStatus
+    }
+
     private var selectedEUICC: EUICCSnapshot {
         appState.euiccSnapshot(for: selectedModuleID)
     }
@@ -1660,6 +1665,9 @@ struct SIMManagementView: View {
     }
 
     private var networkStateText: String {
+        if selectedNetworkMode.isEnabled, let recovery = selectedRecoveryStatus {
+            return recovery.userTitle
+        }
         switch selectedConnectionState {
         case .disabled: return L10n.tr("已关闭")
         case .waitingForModem: return L10n.tr("等待模块")
@@ -1673,6 +1681,14 @@ struct SIMManagementView: View {
     }
 
     private var networkStateColor: Color {
+        if selectedNetworkMode.isEnabled, let recovery = selectedRecoveryStatus {
+            switch recovery.stage {
+            case .connected: return .green
+            case .failed: return recovery.needsUserAction ? .orange : .red
+            case .disconnected: return .secondary
+            default: return .blue
+            }
+        }
         switch selectedConnectionState {
         case .disabled: return .secondary
         case .waitingForModem, .starting, .recovering: return .blue
@@ -1684,6 +1700,9 @@ struct SIMManagementView: View {
     }
 
     private var networkDetailText: String {
+        if selectedNetworkMode.isEnabled, let recovery = selectedRecoveryStatus {
+            return recovery.userDetail
+        }
         switch selectedConnectionState {
         case .disabled:
             return L10n.tr("当前没有启用蜂窝数据；请通过顶部地球按钮选择")

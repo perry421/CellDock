@@ -22,6 +22,8 @@ final class AppState: ObservableObject {
     @Published private(set) var modem = ModemSnapshot()
     @Published private(set) var euicc = EUICCSnapshot.empty
     @Published private(set) var network = CellularNetworkStatus()
+    @Published private(set) var modemRecoveryStatus = ModemRecoveryStatus()
+    @Published private(set) var sleepPowerReductionEnabled: Bool = true
     @Published private(set) var networkStatusesByModuleID:
         [CellularModuleID: CellularNetworkStatus] = [:]
     @Published private(set) var discoveredModemDevices: [DiscoveredModemDevice] = []
@@ -39,6 +41,7 @@ final class AppState: ObservableObject {
         [CellularModuleID: CellularNetworkMode] = [:]
     @Published private(set) var pendingCellularNetworkModesByModuleID:
         [CellularModuleID: CellularNetworkMode] = [:]
+    @Published private(set) var isSwitchingUSBMode = false
     /// The module whose link is being repaired, if any. Recovery reconfigures
     /// the shared service order, so it stays serialized; only the target
     /// changes. Nil means no recovery is running.
@@ -64,6 +67,19 @@ final class AppState: ObservableObject {
     @Published private(set) var launchAtLoginStatus: LaunchAtLoginStatus
     @Published private(set) var isChangingLaunchAtLogin = false
     @Published private(set) var launchAtLoginError: String?
+    /// Controls whether decoded PDU SMS are mirrored into `SMSManager` for
+    /// the recent-Messages list / Mac notification pipeline. The modem always
+    /// operates in PDU mode (`AT+CMGF=0`); this toggle only enables the
+    /// CellDock-side fan-out, not the modem's hardware SMS receiver.
+    @Published var smsReceptionEnabled: Bool
+    /// Whether CellDock posts a macOS notification for new incoming SMS.
+    /// Only effective when `smsReceptionEnabled` is also true.
+    @Published var smsNotificationsEnabled: Bool
+    /// Phase-1 placeholder. The actual `iMessage` relay is intentionally not
+    /// implemented: the user must opt in per release notes once the relay is
+    /// researched and tested against TCC/Automation.
+    @Published var smsIMessageRelayEnabled: Bool
+    @Published private(set) var smsRecent: [ModemSMSMessage] = []
 
     private let modemService = ModemService()
     private let modemInventoryService = ModemInventoryService()
@@ -78,9 +94,39 @@ final class AppState: ObservableObject {
     let callRecordings = CallRecordingStore.shared
     let alertSounds = AlertSoundService.shared
     private let networkController = NetworkServiceController()
+    private let modemRecoveryEngine = ModemRecoveryEngine()
+    private lazy var modemPowerManager: ModemPowerManager = {
+        let transport = ModemServicePowerBridge(
+            sender: { [weak self] command, timeoutMS, completion in
+                guard let self else {
+                    completion(ModemPowerCommandResponse(
+                        outcome: .notOpen,
+                        output: "",
+                        elapsedMS: 0
+                    ))
+                    return
+                }
+                self.primaryDataModemService.executePowerManagementAT(
+                    command,
+                    timeoutMS: timeoutMS,
+                    completion: completion
+                )
+            },
+            backgroundWorkHook: { [weak self] paused in
+                self?.setModemBackgroundWorkPaused(paused)
+            }
+        )
+        return ModemPowerManager(
+            transport: transport,
+            policy: ModemPowerPolicy(
+                sleepPowerReductionEnabled: sleepPowerReductionEnabled
+            )
+        )
+    }()
     private let cellularNetworkingPreferenceStore = CellularNetworkingPreferenceStore()
     private let messageStore = MessageStore()
     private let launchAtLoginController = LaunchAtLoginController()
+    private let smsManager = SMSManager.shared
     private var started = false
     private var lastEUICCProbeIdentity: String?
     private var activeModemLocationID: UInt32?
@@ -120,6 +166,10 @@ final class AppState: ObservableObject {
     private static let autoDeleteReadVerificationMessagesKey =
         "AutoDeleteReadVerificationMessages.v1"
     private static let automaticallyRecordCallsKey = "AutomaticallyRecordCalls.v1"
+    private static let sleepPowerReductionKey = "SleepPowerReduction.v1"
+    private static let smsReceptionEnabledKey = "CellDock.smsReceptionEnabled.v1"
+    private static let smsNotificationsEnabledKey = "CellDock.smsNotificationsEnabled.v1"
+    private static let smsIMessageRelayEnabledKey = "CellDock.smsIMessageRelayEnabled.v1"
 
     init() {
         try? launchAtLoginController.migrateLegacyRegistrationIfNeeded()
@@ -140,11 +190,30 @@ final class AppState: ObservableObject {
             forKey: Self.showsMenuBarNetworkSpeedKey
         )
         launchAtLoginStatus = launchAtLoginController.status
+        if let stored = UserDefaults.standard.object(forKey: Self.sleepPowerReductionKey)
+            as? Bool {
+            sleepPowerReductionEnabled = stored
+        } else {
+            sleepPowerReductionEnabled = true
+        }
         if let storedModuleID = UserDefaults.standard.string(
             forKey: Self.selectedInternetModuleKey
         ) {
             primaryDataModuleID = CellularModuleID(rawValue: storedModuleID)
         }
+        // SMS reception defaults to ON per the product spec, but the iMessage
+        // relay defaults to OFF so a fresh install never silently sends a
+        // message to another device. The macOS notification toggle defaults to
+        // ON; users who deny Notifications permission can leave it on — we
+        // simply no-op the fan-out.
+        smsReceptionEnabled = UserDefaults.standard.object(forKey: Self.smsReceptionEnabledKey)
+            as? Bool ?? true
+        smsNotificationsEnabled = UserDefaults.standard.object(
+            forKey: Self.smsNotificationsEnabledKey
+        ) as? Bool ?? true
+        smsIMessageRelayEnabled = UserDefaults.standard.bool(
+            forKey: Self.smsIMessageRelayEnabledKey
+        )
     }
 
     var unreadCount: Int {
@@ -160,6 +229,10 @@ final class AppState: ObservableObject {
 
     var presentedCellularNetworkingEnabled: Bool {
         presentedCellularNetworkMode.isEnabled
+    }
+
+    var isBackgroundRecoveryServiceRunning: Bool {
+        modemRecoveryEngine.isRunning
     }
 
     var presentedCellularNetworkMode: CellularNetworkMode {
@@ -465,11 +538,71 @@ final class AppState: ObservableObject {
         SOCKSSignalSafety.install()
         socksProxyController.start()
         voWiFiController.start()
+        modemRecoveryEngine.onStatus = { [weak self] status in
+            guard let self else { return }
+            let wasConnected = self.modemRecoveryStatus.stage == .connected
+            self.modemRecoveryStatus = status
+            // Detect the moment we transition back to .connected
+            // after wake, so the diagnostics report can show how
+            // long the user had to wait for internet.
+            if status.stage == .connected,
+               status.recoveredAfterWake,
+               !wasConnected {
+                self.recordPowerInternetRestored(at: Date())
+            }
+        }
+        modemRecoveryEngine.onRequestRefresh = { [weak self] in
+            guard let self else { return }
+            self.modemInventoryService.refresh()
+            self.primaryDataModemService.refreshConnectionHealth()
+            self.networkController.refresh()
+        }
+        modemRecoveryEngine.onRequestSoftRecovery = { [weak self] stage in
+            guard let self else { return }
+            if self.network.isActive, self.network.internetReachable == false {
+                // A failed external probe does not justify restarting a healthy
+                // modem or changing its configuration. Recheck at the network
+                // layer and leave the data path untouched.
+                self.networkController.refresh()
+                return
+            }
+            switch stage {
+            case .establishingDataConnection, .recoveringNetwork:
+                self.scheduleCellularLinkRecoveryIfNeeded()
+            default:
+                self.primaryDataModemService.requestConnectionRecovery()
+            }
+        }
+        modemPowerManager.onStatusChanged = { [weak self] status in
+            guard let self else { return }
+            self.modemRecoveryEngine.applyPowerStatus(status)
+            switch status.phase {
+            case .preparingForSleep, .suspended:
+                self.networkController.stopMonitoring()
+            case .waking:
+                self.networkController.startMonitoring()
+            case .active:
+                break
+            }
+        }
+        modemRecoveryEngine.onSystemWillSleep = { [weak self] in
+            self?.modemPowerManager.handleSleep()
+        }
+        modemRecoveryEngine.onSystemDidWake = { [weak self] in
+            self?.modemPowerManager.handleWake()
+        }
+        modemRecoveryEngine.setDataConnectionExpected(cellularNetworkMode.isEnabled)
+        modemRecoveryEngine.start()
         modemInventoryService.onDevices = { [weak self] devices in
             guard let self else { return }
             self.discoveredModemDevices = devices
+            self.modemService.setUSBDetected(!devices.isEmpty)
+            self.modemRecoveryEngine.updateUSBDetected(!devices.isEmpty)
             self.reconcileDiscoveredModuleRoles()
             self.reconcileSecondaryModemServices()
+            for (locationID, service) in self.secondaryModemServices {
+                service.setUSBDetected(devices.contains { $0.locationID == locationID })
+            }
             self.refreshPendingNetworkModuleRestart()
         }
         modemInventoryService.start()
@@ -494,6 +627,8 @@ final class AppState: ObservableObject {
                 self.socksProxyController.stop()
                 self.voWiFiController.stop()
                 self.modemInventoryService.stop()
+                self.modemRecoveryEngine.stop()
+                self.modemPowerManager.cancelAllTransitions()
                 self.shutdownAllModemServices(completion: completion)
             }
             if self.callRecordings.isRecording {
@@ -559,6 +694,10 @@ final class AppState: ObservableObject {
                 self.activeModemLocationID = locationID
             }
             self.modem = snapshot
+            self.modemRecoveryEngine.setDataConnectionExpected(
+                self.cellularNetworkMode.isEnabled
+            )
+            self.modemRecoveryEngine.updateModem(snapshot)
             self.reconcileDiscoveredModuleRoles()
             self.reconcileSecondaryModemServices()
             self.completePendingNetworkModuleRestartIfReady(
@@ -611,6 +750,10 @@ final class AppState: ObservableObject {
         networkController.onStatus = { [weak self] status in
             guard let self else { return }
             self.network = status
+            self.modemRecoveryEngine.setDataConnectionExpected(
+                self.cellularNetworkMode.isEnabled
+            )
+            self.modemRecoveryEngine.updateNetwork(status)
             cellularNetworkLogger.info(
                 "Status interface=\(status.bsdName ?? "none", privacy: .public) enabled=\(status.isEnabled) active=\(status.isActive) present=\(status.isHardwarePresent) prioritized=\(status.isPrioritized)"
             )
@@ -657,6 +800,11 @@ final class AppState: ObservableObject {
             if let selectedID = self.primaryDataModuleID,
                let selectedStatus = mapped[selectedID] {
                 self.network = selectedStatus
+                self.modemRecoveryEngine.updateModem(self.primaryDataModemSnapshot)
+                self.modemRecoveryEngine.setDataConnectionExpected(
+                    self.networkMode(for: selectedID).isEnabled
+                )
+                self.modemRecoveryEngine.updateNetwork(selectedStatus)
             }
             self.scheduleCellularLinkRecoveryIfNeeded()
         }
@@ -668,6 +816,7 @@ final class AppState: ObservableObject {
     }
 
     func refresh() {
+        modemRecoveryEngine.requestManualRefresh()
         modemInventoryService.refresh()
         modemService.refresh()
         for service in secondaryModemServices.values { service.refresh() }
@@ -813,6 +962,7 @@ final class AppState: ObservableObject {
 
     private func installSecondaryModemService(for device: DiscoveredModemDevice) {
         let service = ModemService(locationID: device.locationID)
+        service.setUSBDetected(true)
         let euiccService = EUICCService(modemService: service)
         euiccService.onSnapshot = { [weak self] snapshot in
             self?.handleEUICCSnapshot(snapshot, moduleID: device.moduleID)
@@ -908,6 +1058,7 @@ final class AppState: ObservableObject {
                 locationID: device.locationID
             )
             if self.primaryDataModuleID == id {
+                self.modemRecoveryEngine.updateModem(snapshot)
                 self.prepareCellularRestore(for: snapshot)
                 self.scheduleCellularLinkRecoveryIfNeeded()
             }
@@ -942,12 +1093,19 @@ final class AppState: ObservableObject {
         if autoDeleteReadVerificationMessages {
             messageStore.fillMissingVerificationReadDates()
         }
+        // Mirror newly discovered messages into SMSManager for the SIM SMS
+        // list UI. This happens on every onMessages callback, including
+        // initial sync, so the list always reflects the current store.
+        _ = smsManager.ingest(newMessages)
+        smsRecent = smsManager.messages
         let updatedMessages = messageStore.messages
         if messages != updatedMessages {
             messages = updatedMessages
             scheduleVerificationAutoDelete()
         }
-        guard !isInitialSync else { return }
+        guard !isInitialSync, smsNotificationsEnabled else { return }
+        // Only this path posts macOS notifications — SMSManager never calls
+        // NotificationService, so each SMS triggers exactly one notification.
         for message in newMessages {
             alertSounds.playMessageAlert()
             NotificationService.shared.postNewMessage(
@@ -1347,6 +1505,9 @@ final class AppState: ObservableObject {
                     if let selectedID = self.primaryDataModuleID,
                        let locationID = self.locationID(for: selectedID) {
                         self.cellularNetworkMode = updatedModes[selectedID] ?? .off
+                        self.modemRecoveryEngine.setDataConnectionExpected(
+                            self.cellularNetworkMode.isEnabled
+                        )
                         self.cellularRestoreDesiredMode = self.cellularNetworkMode
                         self.cellularRestoreModuleIdentity = self.moduleSnapshot(
                             for: selectedID
@@ -1358,6 +1519,7 @@ final class AppState: ObservableObject {
                         )
                     } else {
                         self.cellularNetworkMode = .off
+                        self.modemRecoveryEngine.setDataConnectionExpected(false)
                         self.cellularRestoreDesiredMode = .off
                         self.networkController.setPreferredLocationID(nil)
                         UserDefaults.standard.removeObject(forKey: Self.selectedInternetModuleKey)
@@ -2017,9 +2179,60 @@ final class AppState: ObservableObject {
         dismissTransientMessage()
         primaryDataModemService.configureECM { [weak self] result in
             guard let self else { return }
-            self.isConfiguringECM = false
+        self.isConfiguringECM = false
             self.show(result)
         }
+    }
+
+    private func currentUSBModeState() -> USBModeState {
+        if !modem.isConnected {
+            return .error(L10n.tr("未连接 DJI 4G 模块"))
+        }
+        guard let usbConfiguration = modem.usbConfiguration else {
+            return modem.usbIdentity != nil ? .error("DJI 4G 模块的 USB 配置尚未读取") : .loading
+        }
+        // Single source of truth lives in `ModemUSBConfiguration`: a composition
+        // with a disabled protected interface (diag/nmea/at/modem/net/adb) or an
+        // unverified identity is unsafe and must never masquerade as a known
+        // mode. Only a `knownSafe` QDC507 profile maps to Mac/Mobile — both the
+        // DJI-original (audio=1) and CellDock-compatible (audio=0) states qualify.
+        guard usbConfiguration.knownSafe else {
+            return .unsupported
+        }
+        return usbConfiguration.usbConnectionMode == .mac ? .mac : .mobile
+    }
+
+    /// The current USB mode, refreshed from the latest modem snapshot.
+    /// `.switching` is surfaced only while a switch is in flight; a disconnected
+    /// module is reported as an error state rather than a guess.
+    var usbModeState: USBModeState {
+        isSwitchingUSBMode ? .switching : currentUSBModeState()
+    }
+
+    private func performUSBModeSwitch(to target: USBConnectionMode) {
+        guard !isSwitchingUSBMode else { return }
+        guard modem.isConnected else {
+            presentTransientMessage(L10n.tr("请先连接 DJI 4G 模块再切换 USB 模式。"))
+            return
+        }
+        isSwitchingUSBMode = true
+        dismissTransientMessage()
+        modemService.switchUSBMode(to: target) { [weak self] result in
+            guard let self else { return }
+            self.isSwitchingUSBMode = false
+            self.refresh()
+            self.show(result)
+        }
+    }
+
+    /// Switch the module to Mac / CellDock mode (UAC = 1).
+    func switchToMacUSBMode() {
+        performUSBModeSwitch(to: .mac)
+    }
+
+    /// Prepare the module for iPhone / Mobile use (UAC = 0).
+    func prepareForiPhone() {
+        performUSBModeSwitch(to: .mobile)
     }
 
     func convertDJIModuleIdentity() {
@@ -2067,6 +2280,54 @@ final class AppState: ObservableObject {
         }
     }
 
+    func setSleepPowerReductionEnabled(_ enabled: Bool) {
+        guard sleepPowerReductionEnabled != enabled else { return }
+        sleepPowerReductionEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.sleepPowerReductionKey)
+        modemPowerManager.setSleepPowerReductionEnabled(enabled)
+    }
+
+    /// Controls whether decoded PDU SMS are mirrored into `SMSManager` for
+    /// the SIM SMS list UI. Does NOT change the modem's `AT+CMGF` state —
+    /// the modem always stays in PDU mode.
+    func setSMSReceptionEnabled(_ enabled: Bool) {
+        guard smsReceptionEnabled != enabled else { return }
+        smsReceptionEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.smsReceptionEnabledKey)
+        if !enabled {
+            smsManager.clear()
+            smsRecent = []
+        }
+    }
+
+    func setSMSNotificationsEnabled(_ enabled: Bool) {
+        guard smsNotificationsEnabled != enabled else { return }
+        smsNotificationsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.smsNotificationsEnabledKey)
+    }
+
+    func setSMSIMessageRelayEnabled(_ enabled: Bool) {
+        guard smsIMessageRelayEnabled != enabled else { return }
+        smsIMessageRelayEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.smsIMessageRelayEnabledKey)
+    }
+
+    func clearSMSRecent() {
+        smsManager.clear()
+        smsRecent = []
+    }
+
+    fileprivate func recordPowerInternetRestored(at date: Date) {
+        modemPowerManager.recordInternetRestore(at: date)
+    }
+
+    fileprivate func setModemBackgroundWorkPaused(_ paused: Bool) {
+        modemService.setPowerManagementBackgroundWorkPaused(paused)
+        for service in secondaryModemServices.values {
+            service.setPowerManagementBackgroundWorkPaused(paused)
+        }
+    }
+
     func setPresentationPrivacyEnabled(_ enabled: Bool) {
         guard isPresentationPrivacyEnabled != enabled else { return }
         isPresentationPrivacyEnabled = enabled
@@ -2081,6 +2342,20 @@ final class AppState: ObservableObject {
         NotificationService.shared.authorizationStatus { [weak self] status in
             self?.notificationAuthorizationStatus = status
         }
+    }
+
+    func copyModemConnectionDiagnostics() {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString")
+            as? String ?? "unknown"
+        let report = ModemConnectionDiagnosticsReport.make(
+            status: modemRecoveryStatus,
+            modem: primaryDataModemSnapshot,
+            network: network,
+            appVersion: version
+        )
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(report, forType: .string)
+        presentTransientMessage(L10n.tr("诊断报告已复制。"))
     }
 
     func requestNotificationAuthorization() {
@@ -2282,6 +2557,22 @@ final class AppState: ObservableObject {
             self.isExecutingAT = false
             completion(result)
         }
+    }
+
+    /// Raw AT passthrough for the USB-mode test surface. Unlike `executeAT`
+    /// this does not touch the console busy-flag or eSIM guards — the USB-mode
+    /// controller must be able to issue its readback while the app considers
+    /// itself idle. Commands come exclusively from the verified USBCFG set.
+    func executeDiagnosticATViaPrimaryModule(
+        _ command: String,
+        timeoutMS: Int,
+        completion: @escaping (_ output: String, _ code: Int32) -> Void
+    ) {
+        primaryDataModemService.executeDiagnosticAT(
+            command,
+            timeoutMS: timeoutMS,
+            completion: completion
+        )
     }
 
     func sendSMS(

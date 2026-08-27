@@ -133,13 +133,22 @@ enum CallATParser {
         }
     }
 
+    /// Whether the firmware identity belongs to the Quectel QDC507 / EG25-G build
+    /// that uses the UAC voice-over-USB path (`AT+QPCMV=1,2`) rather than the
+    /// classic raw-PCM path. The non-persistent UAC voice function must only be
+    /// enabled for this firmware; standard EC25 modules keep `AT+QPCMV=1,0`.
+    static func isQDCVoiceFirmware(_ firmwareIdentity: String) -> Bool {
+        firmwareIdentity.uppercased().contains("QDC507") ||
+            firmwareIdentity.uppercased().contains("EG25")
+    }
+
     static func preferredMediaBackend(
         firmwareIdentity: String,
         supportsRawPCM: Bool,
         hasUSBLocation: Bool
     ) -> PreferredCallMediaBackend {
         guard hasUSBLocation else { return .none }
-        if firmwareIdentity.uppercased().contains("QDC507") {
+        if isQDCVoiceFirmware(firmwareIdentity) {
             return .qdcModuleBridge
         }
         return supportsRawPCM ? .qpcmv : .none

@@ -1,7 +1,13 @@
 import Foundation
+import OSLog
 
 final class ModuleVoiceRuntime {
     typealias Manifest = ModuleVoiceManifest
+
+    private static let log = Logger(
+        subsystem: "app.celldock.mac",
+        category: "VoiceRuntime"
+    )
 
     private enum ResourceSource {
         case payload(URL)
@@ -167,7 +173,9 @@ final class ModuleVoiceRuntime {
 
     func prepare() throws -> String {
         if prepared { return manifest.runtimeVersion }
+        Self.log.info("[VoiceRuntime] prepare start kernel_target=\(self.manifest.kernelRelease, privacy: .public)")
         try probeControlChannel()
+        Self.log.info("[VoiceRuntime] ADB control channel OK (root)")
         let release = try controller.shellChecked("uname -r", timeout: 8)
         guard release.status == 0,
               release.output.split(whereSeparator: { $0.isWhitespace })
@@ -180,6 +188,7 @@ final class ModuleVoiceRuntime {
                 )
             )
         }
+        Self.log.info("[VoiceRuntime] kernel match actual=\(release.output, privacy: .public)")
         try checked("mkdir -p '\(remoteDirectory)' && chmod 700 '\(remoteDirectory)'")
         var modulesLoadedHere: [Manifest.KernelModule] = []
         defer { try? removeRemoteKernelModuleFiles() }
@@ -197,6 +206,7 @@ final class ModuleVoiceRuntime {
             }
 
             if try !soundDevicesReady() {
+                Self.log.info("[VoiceRuntime] sound devices NOT ready; loading kernel modules")
                 let legacyDriver = try controller.shellChecked(
                     "grep -q '^qdc507_afe ' /proc/modules",
                     timeout: 8
@@ -241,10 +251,12 @@ final class ModuleVoiceRuntime {
                             .compactMap { $0 }
                             .filter { !$0.isEmpty }
                             .joined(separator: "\n")
+                        Self.log.error("[VoiceRuntime] insmod \(module.name, privacy: .public) FAILED: \(detail, privacy: .public)")
                         throw RuntimeError.moduleCommand(
                             detail.isEmpty ? L10n.tr("模块音频驱动加载失败。") : detail
                         )
                     }
+                    Self.log.info("[VoiceRuntime] insmod \(module.name, privacy: .public) OK")
                     modulesLoadedHere.append(module)
                     try removeRemoteComponent(module.file)
                 }
@@ -252,24 +264,29 @@ final class ModuleVoiceRuntime {
             try removeRemoteKernelModuleFiles()
             guard try waitForSoundDevices() else {
                 let diagnostics = try? controller.shellChecked("dmesg | tail -n 80", timeout: 8)
+                Self.log.error("[VoiceRuntime] ALSA sound devices did not appear after driver load")
                 throw RuntimeError.moduleCommand(
                     diagnostics?.output.isEmpty == false
                         ? diagnostics!.output
                         : L10n.tr("音频驱动已加载，但 ALSA 设备没有出现。")
                 )
             }
+            Self.log.info("[VoiceRuntime] ALSA sound devices present")
 
             try ensureVoiceCalibrationService()
+            Self.log.info("[VoiceRuntime] VoLTE ACDB calibration ready")
 
             let voiceEndpoints = try controller.shellChecked(
                 "test -c /dev/ttyGS0 && test -p /run/voc_svr",
                 timeout: 8
             )
             guard voiceEndpoints.status == 0 else {
+                Self.log.error("[VoiceRuntime] missing ttyGS0 or voc_svr")
                 throw RuntimeError.moduleCommand(
                     L10n.tr("模块缺少 ttyGS0 或 voc_svr，无法建立 USB 通话桥。")
                 )
             }
+            Self.log.info("[VoiceRuntime] ttyGS0 + voc_svr present")
 
             let helperPath = "\(remoteDirectory)/\(manifest.helper)"
             let check = try controller.shellChecked(
@@ -281,7 +298,9 @@ final class ModuleVoiceRuntime {
                     check.output.isEmpty ? L10n.tr("模块 PCM 桥自检失败。") : check.output
                 )
             }
+            Self.log.info("[VoiceRuntime] PCM bridge self-check OK; prepare complete")
         } catch {
+            Self.log.error("[VoiceRuntime] prepare failed: \(error.localizedDescription, privacy: .public)")
             let rollbackError = unloadModulesLoadedHere(modulesLoadedHere)
             if let rollbackError, !rollbackError.isEmpty {
                 throw RuntimeError.moduleCommand(
@@ -295,6 +314,7 @@ final class ModuleVoiceRuntime {
             throw error
         }
         prepared = true
+        Self.log.info("[VoiceRuntime] prepare completed version=\(self.manifest.runtimeVersion, privacy: .public)")
         return manifest.runtimeVersion
     }
 

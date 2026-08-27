@@ -287,9 +287,14 @@ enum ATResponseParser {
 
         if technology.contains("LTE"), numbers.count >= 4 {
             let rsrp = numbers[1]
+            let sinrRaw = numbers[2]
             let rsrq = numbers[3]
             let primary = (-140 ... -44).contains(rsrp) ? rsrp : rssi
-            return (primary, technology, "RSSI \(rssi) · RSRP \(rsrp) · RSRQ \(rsrq)")
+            return (
+                primary,
+                technology,
+                "RSSI \(rssi) · RSRP \(rsrp) · RSRQ \(rsrq) · SINR raw \(sinrRaw)"
+            )
         }
 
         return (rssi, technology, "RSSI \(rssi) dBm")
@@ -420,6 +425,108 @@ enum ATResponseParser {
         return pdus
     }
 
+    /// Distinguishes a text-mode `+CMT:` header (`AT+CMGF=1`) from the
+    /// PDU-mode form (`AT+CMGF=0`, last field is the TPDU length).
+    ///
+    /// Heuristic: in PDU mode the last field of the comma-separated header is
+    /// a non-negative integer (the declared TPDU length); in text mode the
+    /// last meaningful field is either a quoted timestamp or a string. A
+    /// bare trailing integer is the only shape PDU mode ever takes, so any
+    /// non-integer / quoted trailing field is treated as text mode.
+    static func isTextModeCMTHeader(_ header: String) -> Bool {
+        var payload = header
+        if payload.hasPrefix("+CMT:") { payload.removeFirst("+CMT:".count) }
+        payload = payload.trimmingCharacters(in: .whitespaces)
+        let fields = splitCSV(payload)
+        guard let last = fields.last else { return false }
+        let trimmed = last.trimmingCharacters(in: .whitespacesAndNewlines)
+        if Int(trimmed) != nil { return false }
+        // Quoted SCTS or alphanumeric content is text mode.
+        return trimmed.first == "\"" || trimmed.contains(":")
+    }
+
+    /// Parses the SCTS string from a `+CMT:` text-mode header. Format follows
+    /// 3GPP TS 27.005 §3.4: `YY/MM/DD,HH:MM:SS[±ZZ]` or `YY/MM/DD HH:MM:SS`.
+    /// Returns `nil` when the field is empty or unparseable.
+    static func parseSCTSTimestamp(_ value: String) -> Date? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= "26/08/26,12:15:23".count else { return nil }
+        let normalized = trimmed.replacingOccurrences(of: " ", with: ",")
+        let parts = normalized.split(separator: ",")
+        guard parts.count >= 2 else { return nil }
+
+        func decimal(_ string: Substring) -> Int? {
+            guard let value = Int(string), (0...99).contains(value) else { return nil }
+            return value
+        }
+
+        let datePart = parts[0]
+        // The time field may carry an appended timezone (`12:15:23+32`); strip
+        // it before parsing the HH/MM/SS components and reuse it as the
+        // timezone offset. This matches what the QDC507 firmware actually
+        // emits in our `+CMT:` text-mode samples.
+        var timePart = parts[1]
+        var trailingTimezone = ""
+        if timePart.count > 8 {
+            let suffix = timePart.dropFirst(8)
+            if let first = suffix.first, first == "+" || first == "-" {
+                trailingTimezone = String(suffix)
+                timePart = timePart.prefix(8)
+            }
+        }
+        let explicitTimezone = parts.count >= 3 ? String(parts[2]) : ""
+        let tzString = !trailingTimezone.isEmpty ? trailingTimezone : explicitTimezone
+
+        guard datePart.count == 8,
+              timePart.count == 8,
+              decimal(datePart.prefix(2)) != nil,
+              decimal(datePart.dropFirst(3).prefix(2)) != nil,
+              decimal(datePart.suffix(2)) != nil,
+              decimal(timePart.prefix(2)) != nil,
+              decimal(timePart.dropFirst(3).prefix(2)) != nil,
+              decimal(timePart.suffix(2)) != nil else {
+            return nil
+        }
+
+        let shortYear = Int(datePart.prefix(2)) ?? 0
+        let month = Int(datePart.dropFirst(3).prefix(2)) ?? 0
+        let day = Int(datePart.suffix(2)) ?? 0
+        let hour = Int(timePart.prefix(2)) ?? 0
+        let minute = Int(timePart.dropFirst(3).prefix(2)) ?? 0
+        let second = Int(timePart.suffix(2)) ?? 0
+
+        var components = DateComponents()
+        components.year = shortYear >= 70 ? 1900 + shortYear : 2000 + shortYear
+        components.month = month
+        components.day = day
+        components.hour = hour
+        components.minute = minute
+        components.second = second
+
+        // `tzString` was already resolved on line 478; the previous
+        // edit left a redundant redeclaration here that broke the
+        // build. Reuse the earlier binding instead of shadowing it.
+        if tzString.count >= 3 {
+            let signChar = tzString.first
+            let sign: Int = signChar == "-" ? -1 : 1
+            let digits = tzString.dropFirst().prefix(2)
+            if let quarterHours = Int(digits) {
+                let secondsFromGMT = quarterHours * 15 * 60 * sign
+                if let zone = TimeZone(secondsFromGMT: secondsFromGMT) {
+                    components.timeZone = zone
+                }
+            }
+        }
+        if components.timeZone == nil {
+            components.timeZone = TimeZone(secondsFromGMT: 0)
+        }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = components.timeZone ?? .current
+        guard components.isValidDate(in: calendar) else { return nil }
+        return calendar.date(from: components)
+    }
+
     static func parseCPMSStorage(_ response: String) -> String? {
         guard let line = normalizedLines(response).first(where: { $0.hasPrefix("+CPMS:") }) else {
             return nil
@@ -450,7 +557,7 @@ enum ATResponseParser {
         return fields
     }
 
-    private static func unquote(_ value: String) -> String {
+    static func unquote(_ value: String) -> String {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard trimmed.count >= 2, trimmed.first == "\"", trimmed.last == "\"" else {
             return trimmed

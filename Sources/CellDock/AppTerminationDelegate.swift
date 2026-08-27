@@ -45,7 +45,9 @@ final class AppTerminationDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showInitialCommunicationWindowIfNeeded() {
-        guard !didShowInitialCommunicationWindow, let appState else { return }
+        guard !CellDockLaunchContext.isBackgroundConnectionService,
+              !didShowInitialCommunicationWindow,
+              let appState else { return }
         didShowInitialCommunicationWindow = true
         DispatchQueue.main.async {
             appState.showMessagesWindow()

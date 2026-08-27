@@ -60,6 +60,7 @@ uint16_t celldock_modem_vendor_id(const CellDockModem *modem);
 uint16_t celldock_modem_product_id(const CellDockModem *modem);
 uint32_t celldock_modem_location_id(const CellDockModem *modem);
 uint64_t celldock_modem_registry_id(const CellDockModem *modem);
+uint8_t celldock_modem_interface_count(const CellDockModem *modem);
 uint8_t celldock_modem_input_endpoint(const CellDockModem *modem);
 uint8_t celldock_modem_output_endpoint(const CellDockModem *modem);
 void celldock_modem_set_stream_callback(

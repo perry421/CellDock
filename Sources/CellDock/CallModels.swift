@@ -72,8 +72,17 @@ struct CallSnapshot: Equatable {
         }
     }
 
+    /// Whether the AT call-control path is ready to place a call.
+    ///
+    /// Call control (ATD/ATA/ATH) is deliberately decoupled from audio-media
+    /// readiness. A module whose AT channel is up, SIM ready and network
+    /// registered can dial/answer/hang up even if its UAC audio path is not yet
+    /// usable — in that case we still permit dialing and surface "音频未就绪"
+    /// via `lastError` instead of refusing the call. `voiceOverUSBSupported`
+    /// therefore no longer gates dialing; it only reflects whether the media
+    /// backend is known-good.
     var canDial: Bool {
-        phase == .idle && voiceOverUSBSupported && !mediaCleanupPending
+        phase == .idle && !mediaCleanupPending
     }
 
     var canSendDTMF: Bool {

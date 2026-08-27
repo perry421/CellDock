@@ -26,3 +26,5 @@ tmp/
 # Project-specific
 website/
 .codex/
+handoff.md
+*.log

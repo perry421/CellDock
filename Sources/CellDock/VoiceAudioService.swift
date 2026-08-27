@@ -81,6 +81,7 @@ final class VoiceAudioService {
 
     func start(
         matchingLocationID: UInt32,
+        interfaceNumber: UInt8 = 1,
         completion: @escaping (ModemActionResult) -> Void
     ) {
         guard matchingLocationID != 0 else {
@@ -110,13 +111,21 @@ final class VoiceAudioService {
                 }
                 return
             }
-            let openResult = celldock_voice_open_for_location(voice, matchingLocationID)
+            let openResult = interfaceNumber == 1
+                ? celldock_voice_open_for_location(voice, matchingLocationID)
+                : celldock_voice_open_interface_for_location(
+                    voice,
+                    matchingLocationID,
+                    interfaceNumber
+                )
             guard openResult == CELLDOCK_MODEM_OK else {
                 let error = String(cString: celldock_voice_last_error(voice))
                 celldock_voice_destroy(voice)
                 DispatchQueue.main.async {
                     completion(.failure(
-                        error.isEmpty ? L10n.tr("无法打开 USB interface 1 语音通道。") : error
+                        error.isEmpty
+                            ? L10n.tr("无法打开 USB interface %d 语音通道。", Int64(interfaceNumber))
+                            : error
                     ))
                 }
                 return

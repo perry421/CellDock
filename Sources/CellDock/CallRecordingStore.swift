@@ -587,7 +587,27 @@ final class CallRecordingCapture: @unchecked Sendable {
             AVNumberOfChannelsKey: 2,
             AVEncoderBitRateKey: 32_000
         ]
-        let output = try AVAudioFile(forWriting: capture.outputURL, settings: settings)
+        let output: AVAudioFile
+        do {
+            output = try AVAudioFile(forWriting: capture.outputURL, settings: settings)
+        } catch {
+            // Some macOS releases expose the M4A container but no AAC encoder.
+            // Keep recording available with stereo PCM in the same container.
+            try? FileManager.default.removeItem(at: capture.outputURL)
+            let fallbackSettings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatLinearPCM,
+                AVSampleRateKey: sampleRate,
+                AVNumberOfChannelsKey: 2,
+                AVLinearPCMBitDepthKey: 16,
+                AVLinearPCMIsFloatKey: false,
+                AVLinearPCMIsBigEndianKey: false,
+                AVLinearPCMIsNonInterleaved: false
+            ]
+            output = try AVAudioFile(
+                forWriting: capture.outputURL,
+                settings: fallbackSettings
+            )
+        }
         let format = output.processingFormat
         let chunkFrames = 4_096
 

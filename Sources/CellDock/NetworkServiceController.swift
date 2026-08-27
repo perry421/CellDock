@@ -21,6 +21,7 @@ final class NetworkServiceController {
     private var lastPublishedStatus: CellularNetworkStatus?
     private var lastPublishedStatuses: [UInt32: CellularNetworkStatus] = [:]
     private var reportedAddressOverlapLocationIDs: Set<UInt32> = []
+    private var internetProbeCache: [String: InternetProbeCacheEntry] = [:]
     private var preferredLocationID: UInt32?
     private let serviceRecordKey = "CellDock.modemNetworkServiceRecord"
     private let knownNames = ["baiwang", "qdc507", "quectel", "ec25", "eg25"]
@@ -162,7 +163,13 @@ final class NetworkServiceController {
                 ipv4Address: ipv4State.address,
                 ipv4Router: ipv4State.router,
                 ipv6Address: activeIPv6,
-                dnsServers: dnsServers
+                dnsServers: dnsServers,
+                internetReachable: internetReachability(
+                    forBSDName: bsdName,
+                    linkIsUsable: linkActive && (
+                        (ipv4State.address != nil && ipv4State.router != nil) || activeIPv6 != nil
+                    )
+                )
             )
         }
 
@@ -292,8 +299,54 @@ final class NetworkServiceController {
             ipv4Router: activeIPv4Router,
             ipv6Address: activeIPv6,
             dnsServers: dnsServers,
+            internetReachable: bsdName.flatMap {
+                internetReachability(
+                    forBSDName: $0,
+                    linkIsUsable: linkActive && (
+                        (activeIPv4 != nil && activeIPv4Router != nil) || activeIPv6 != nil
+                    )
+                )
+            },
             lastError: nil
         )
+    }
+
+    private struct InternetProbeCacheEntry {
+        var value: Bool?
+        var consecutiveFailures = 0
+        var nextProbeAt = Date.distantPast
+    }
+
+    /// Verifies that traffic can leave through the modem's own ECM interface,
+    /// rather than accidentally succeeding over Wi-Fi. The probe is deliberately
+    /// low frequency and reports a failure only after two consecutive misses.
+    private func internetReachability(
+        forBSDName bsdName: String,
+        linkIsUsable: Bool,
+        now: Date = Date()
+    ) -> Bool? {
+        guard linkIsUsable else {
+            internetProbeCache[bsdName] = nil
+            return nil
+        }
+        var cache = internetProbeCache[bsdName] ?? InternetProbeCacheEntry()
+        guard now >= cache.nextProbeAt else { return cache.value }
+
+        let reachable = CellularInternetProbe.isReachable(bsdName: bsdName)
+        if reachable {
+            cache.value = true
+            cache.consecutiveFailures = 0
+            cache.nextProbeAt = now.addingTimeInterval(ModemRecoveryPolicy.internetProbeInterval)
+        } else {
+            cache.consecutiveFailures += 1
+            if cache.consecutiveFailures >= 2 { cache.value = false }
+            cache.nextProbeAt = now.addingTimeInterval(15)
+        }
+        internetProbeCache[bsdName] = cache
+        cellularNetworkLogger.info(
+            "Internet probe interface=\(bsdName, privacy: .public) reachable=\(reachable) failures=\(cache.consecutiveFailures)"
+        )
+        return cache.value
     }
 
     private func services(in networkSet: SCNetworkSet) -> [SCNetworkService] {

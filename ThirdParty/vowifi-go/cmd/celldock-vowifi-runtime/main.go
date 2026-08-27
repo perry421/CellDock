@@ -111,11 +111,11 @@ func run(cfg config) error {
 	transport := simtransport.NewAdapter(at)
 	imsi, err := transport.ReadIMSI()
 	if err != nil {
-		return store.fail("sim", fmt.Errorf("read IMSI: %w", err))
+		return store.block(ctx, "sim_blocked", fmt.Errorf("read IMSI: %w", err))
 	}
 	imei, err := transport.ReadIMEI()
 	if err != nil {
-		return store.fail("sim", fmt.Errorf("read IMEI: %w", err))
+		return store.block(ctx, "sim_blocked", fmt.Errorf("read IMEI: %w", err))
 	}
 	aka := simauth.NewAKAProvider(transport)
 	simAdapter := runtimehost.NewReaderSIMAdapter(&simWithIMSI{AKAProvider: aka, imsi: imsi})
@@ -131,7 +131,7 @@ func run(cfg config) error {
 		Access: access,
 	})
 	if err != nil {
-		return store.fail("identity", fmt.Errorf("prepare carrier identity: %w", err))
+		return store.block(ctx, "sim_blocked", fmt.Errorf("prepare carrier identity: %w", err))
 	}
 	store.update(func(s *status) {
 		s.Phase = "sim_ready"
@@ -144,27 +144,27 @@ func run(cfg config) error {
 	outerRoutes := &outerRouteSet{iface: cfg.OuterInterface, gateway: cfg.OuterGateway}
 	proxy, err := runtimeProxy(cfg.ProxyURL)
 	if err != nil {
-		return store.fail("proxy", err)
+		return store.block(ctx, "network_blocked", err)
 	}
 	defer outerRoutes.cleanup(context.Background())
 	epdgCandidates := []string{prepared.EPDGAddr}
 	if proxy != nil {
 		if parsed, parseErr := url.Parse(proxy.URL); parseErr == nil {
 			if err := outerRoutes.protectHost(ctx, parsed.Hostname()); err != nil {
-				return store.fail("routing", fmt.Errorf("protect proxy route: %w", err))
+				return store.block(ctx, "network_blocked", fmt.Errorf("protect proxy route: %w", err))
 			}
 		}
 	} else {
 		addresses, resolveErr := resolveOuterHost(ctx, prepared.EPDGAddr)
 		if resolveErr != nil {
-			return store.fail("routing", fmt.Errorf("resolve ePDG: %w", resolveErr))
+			return store.block(ctx, "network_blocked", fmt.Errorf("resolve ePDG: %w", resolveErr))
 		}
 		if err := outerRoutes.protectAddresses(ctx, addresses); err != nil {
-			return store.fail("routing", fmt.Errorf("protect ePDG route: %w", err))
+			return store.block(ctx, "network_blocked", fmt.Errorf("protect ePDG route: %w", err))
 		}
 		epdgCandidates = repeatDirectEPDGCandidates(directEPDGCandidates(addresses, 6), 2)
 		if len(epdgCandidates) == 0 {
-			return store.fail("routing", errors.New("resolve ePDG: no usable IP addresses"))
+			return store.block(ctx, "network_blocked", errors.New("resolve ePDG: no usable IP addresses"))
 		}
 	}
 
@@ -236,7 +236,16 @@ func run(cfg config) error {
 	}
 	err = startErr
 	if err != nil {
-		return store.fail(classifyStartError(err), err)
+		switch classifyStartError(err) {
+		case "sim":
+			return store.block(ctx, "sim_blocked", err)
+		case "tunnel":
+			return store.block(ctx, "tunnel_blocked", err)
+		case "ims":
+			return store.block(ctx, "ims_blocked", err)
+		default:
+			return store.fail("runtime", err)
+		}
 	}
 	defer instance.Stop(context.Background())
 	diagnostic := instance.DiagnosticState()
@@ -588,6 +597,19 @@ func (s *statusStore) fail(class string, err error) error {
 		current.LastReason = runtimehost.SafeDiagnosticError(err)
 	})
 	return err
+}
+
+// A carrier, SIM, route, IKE/ePDG, or IMS failure blocks that stage; it does
+// not mean the runtime process itself failed. Keep the host alive so status
+// remains observable and a later explicit restart can retry the real stage.
+func (s *statusStore) block(ctx context.Context, phase string, err error) error {
+	s.update(func(current *status) {
+		current.Phase = phase
+		current.LastErrorClass = ""
+		current.LastReason = runtimehost.SafeDiagnosticError(err)
+	})
+	<-ctx.Done()
+	return nil
 }
 
 func (s *statusStore) write() error {

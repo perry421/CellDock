@@ -55,6 +55,7 @@ struct CellDockSettingsView: View {
     @State private var didResolveInitialCategory = false
     @State private var isConfirmingVerificationAutoDelete = false
     @State private var isConfirmingAutomaticRecording = false
+    @State private var isPresentingSMSReceptionList = false
     @State private var soundImportError: String?
     @State private var microphoneAuthorizationStatus =
         AVCaptureDevice.authorizationStatus(for: .audio)
@@ -296,8 +297,157 @@ struct CellDockSettingsView: View {
         }
     }
 
+    private var usbModeSettingsSection: some View {
+        settingsSection(title: L10n.tr("DJI 4G 模块 · USB 模式")) {
+            VStack(alignment: .leading, spacing: 12) {
+                switch appState.usbModeState {
+                case .mac:
+                    usbModeStatusRow(
+                        title: L10n.tr("Mac / CellDock 模式"),
+                        status: L10n.tr("UAC=1"),
+                        icon: "desktopcomputer"
+                    )
+                    mainUSBModeAction(
+                        title: L10n.tr("Prepare for iPhone"),
+                        systemImage: "iphone.badge.minus",
+                        action: { appState.prepareForiPhone() }
+                    )
+                    usbConfigurationFooter(switchHint: L10n.tr("切换到 Mobile 会关闭 UAC，断开前请确认已选好 iPhone 目标。"))
+                case .mobile:
+                    usbModeStatusRow(
+                        title: L10n.tr("iPhone / Mobile 模式"),
+                        status: L10n.tr("UAC=0"),
+                        icon: "iphone"
+                    )
+                    mainUSBModeAction(
+                        title: L10n.tr("Switch to Mac / CellDock"),
+                        systemImage: "desktopcomputer.arrow.left",
+                        action: { appState.switchToMacUSBMode() }
+                    )
+                    inlineCallout(
+                        L10n.tr("已为 iPhone 关闭 UAC，可安全拔下并接入 iPhone。"),
+                        systemImage: "checkmark.circle",
+                        color: .green
+                    )
+                    usbConfigurationFooter(switchHint: L10n.tr("切换到 Mac 模式会重新开启 UAC。"))
+                case .switching:
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(L10n.tr("正在切换 USB 模式…"))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                case .unsupported:
+                    usbModeStatusRow(
+                        title: L10n.tr("USB 模式未知"),
+                        status: L10n.tr("配置不支持"),
+                        icon: "exclamationmark.triangle.fill"
+                    )
+                    inlineCallout(
+                        L10n.tr("未识别到受支持的 DJI 4G 模块配置，不会自动修改模块。"),
+                        systemImage: "prohibited",
+                        color: .red
+                    )
+                case .loading:
+                    HStack(spacing: 8) {
+                        ProgressView().controlSize(.small)
+                        Text(L10n.tr("正在读取 USB 配置…"))
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                    }
+                case let .error(message):
+                    usbModeStatusRow(
+                        title: L10n.tr("USB 模式不可用"),
+                        status: L10n.tr("未连接"),
+                        icon: "cable.connector.slash"
+                    )
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(16)
+        }
+    }
+
+    @State private var isUSBModeTestPresented = false
+
+    /// Minimal live-hardware test surface for the UAC/audio ON↔OFF switch.
+    private var usbModeTestSection: some View {
+        settingsSection(title: L10n.tr("USB 模式实机测试")) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("通过已验证的 USBCFG 链路执行 Audio ON/OFF 切换；写入前自动备份，回读校验失败自动回滚。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button {
+                    isUSBModeTestPresented = true
+                } label: {
+                    Label("打开 USB 模式实机测试", systemImage: "wrench.and.screwdriver")
+                }
+                .adaptiveGlassButton()
+            }
+            .padding(16)
+        }
+        .sheet(isPresented: $isUSBModeTestPresented) {
+            USBModeTestView()
+                .environmentObject(appState)
+        }
+    }
+
+    @ViewBuilder
+    private func usbModeStatusRow(title: String, status: String, icon: String) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .frame(width: 18)
+                .foregroundStyle(.tint)
+            Text(title)
+                .font(.headline)
+            Spacer()
+            Text(status)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func mainUSBModeAction(
+        title: String,
+        systemImage: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                Text(title)
+            }
+        }
+        .buttonStyle(.borderedProminent)
+        .controlSize(.regular)
+    }
+
+    @ViewBuilder
+    private func usbConfigurationFooter(switchHint: String) -> some View {
+        if let usbConfiguration = appState.modem.usbConfiguration {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(String(
+                    format: "USB VID: %04X · PID: %04X",
+                    usbConfiguration.vendorID,
+                    usbConfiguration.productID
+                ))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                Text(switchHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
     private var generalSettings: some View {
         VStack(spacing: 16) {
+            usbModeSettingsSection
+
+            usbModeTestSection
+
             settingsSection(title: L10n.tr("隐私保护")) {
                 VStack(spacing: 12) {
                     settingRow(
@@ -395,6 +545,28 @@ struct CellDockSettingsView: View {
                     Divider().padding(.horizontal, 16)
 
                     settingRow(
+                        title: L10n.tr("后台连接恢复"),
+                        detail: appState.isBackgroundRecoveryServiceRunning
+                            ? L10n.tr("关闭窗口后继续监测 USB、AT、SIM 与蜂窝数据")
+                            : L10n.tr("恢复服务未运行")
+                    ) {
+                        Label(
+                            appState.isBackgroundRecoveryServiceRunning
+                                ? L10n.tr("运行中")
+                                : L10n.tr("已停止"),
+                            systemImage: appState.isBackgroundRecoveryServiceRunning
+                                ? "checkmark.circle.fill"
+                                : "xmark.circle"
+                        )
+                        .foregroundStyle(
+                            appState.isBackgroundRecoveryServiceRunning ? .green : .secondary
+                        )
+                    }
+                    .padding(16)
+
+                    Divider().padding(.horizontal, 16)
+
+                    settingRow(
                         title: L10n.tr("未连接模块时隐藏菜单栏图标"),
                         detail: appState.hideMenuBarIconWhenDisconnected
                             ? L10n.tr("重新连接模块后自动显示")
@@ -408,24 +580,58 @@ struct CellDockSettingsView: View {
                         .toggleStyle(.adaptiveGlass)
                     }
                     .padding(16)
+
+                    Divider().padding(.horizontal, 16)
+
+                    settingRow(
+                        title: L10n.tr("Mac 睡眠时降低 4G 模块功耗"),
+                        detail: appState.sleepPowerReductionEnabled
+                            ? L10n.tr("合盖时将模块切到低功耗，开盖后自动恢复 4G")
+                            : L10n.tr("合盖时模块保持常驻耗电，仅在明确禁用时选择")
+                    ) {
+                        Toggle("Mac 睡眠时降低 4G 模块功耗", isOn: Binding(
+                            get: { appState.sleepPowerReductionEnabled },
+                            set: { appState.setSleepPowerReductionEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.adaptiveGlass)
+                    }
+                    .padding(16)
                 }
             }
 
             settingsSection(title: L10n.tr("应用操作")) {
-                settingRow(
-                    title: L10n.tr("完全退出 CellDock"),
-                    detail: L10n.tr("关闭窗口不会停止短信、来电和模块监测")
-                ) {
-                    Button(role: .destructive) {
-                        appState.quit()
-                    } label: {
-                        Label("完全退出 CellDock", systemImage: "power")
+                VStack(spacing: 0) {
+                    settingRow(
+                        title: L10n.tr("复制连接诊断报告"),
+                        detail: L10n.tr("不包含 ICCID、IMSI、IMEI 或电话号码")
+                    ) {
+                        Button {
+                            appState.copyModemConnectionDiagnostics()
+                        } label: {
+                            Label("复制诊断报告", systemImage: "doc.on.doc")
+                        }
+                        .adaptiveGlassButton()
                     }
-                    .adaptiveGlassButton()
-                    .tint(.red)
-                    .help("完全退出 CellDock，并停止后台短信、来电和模块监测")
+                    .padding(16)
+
+                    Divider().padding(.horizontal, 16)
+
+                    settingRow(
+                        title: L10n.tr("完全退出 CellDock"),
+                        detail: L10n.tr("关闭窗口不会停止短信、来电和模块监测")
+                    ) {
+                        Button(role: .destructive) {
+                            appState.quit()
+                        } label: {
+                            Label("完全退出 CellDock", systemImage: "power")
+                        }
+                        .adaptiveGlassButton()
+                        .tint(.red)
+                        .help("完全退出 CellDock，并停止后台短信、来电和模块监测")
+                    }
+                    .padding(16)
                 }
-                .padding(16)
             }
         }
     }
@@ -486,7 +692,7 @@ struct CellDockSettingsView: View {
 
     private var communicationSettings: some View {
         VStack(spacing: 16) {
-            moduleStatusStrip
+            moduleStatusPanel
 
             settingsSection(title: L10n.tr("声音")) {
                 VStack(spacing: 0) {
@@ -548,6 +754,67 @@ struct CellDockSettingsView: View {
                     )
                 }
                 .padding(16)
+            }
+
+            settingsSection(title: L10n.tr("收到的 SIM 卡短信")) {
+                VStack(spacing: 12) {
+                    settingRow(
+                        title: L10n.tr("SIM 短信列表"),
+                        detail: L10n.tr("在设置中显示通过 PDU 接收到的 SIM 短信最近列表")
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { appState.smsReceptionEnabled },
+                            set: { appState.setSMSReceptionEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.adaptiveGlass)
+                    }
+
+                    settingRow(
+                        title: L10n.tr("收到短信时通知"),
+                        detail: L10n.tr("Mac 系统通知横幅、声音与最近短信列表")
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { appState.smsNotificationsEnabled },
+                            set: { appState.setSMSNotificationsEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.adaptiveGlass)
+                        .disabled(!appState.smsReceptionEnabled)
+                    }
+
+                    settingRow(
+                        title: L10n.tr("自动转发到 iMessage"),
+                        detail: L10n.tr("第一阶段默认关闭，后续版本接入 AppleScript / Shortcuts")
+                    ) {
+                        Toggle("", isOn: Binding(
+                            get: { appState.smsIMessageRelayEnabled },
+                            set: { appState.setSMSIMessageRelayEnabled($0) }
+                        ))
+                        .labelsHidden()
+                        .toggleStyle(.adaptiveGlass)
+                        .disabled(true)
+                    }
+
+                    Button {
+                        isPresentingSMSReceptionList = true
+                    } label: {
+                        Label(
+                            appState.smsRecent.isEmpty
+                                ? L10n.tr("查看短信列表")
+                                : L10n.tr("查看短信列表（%lld 条）", Int64(appState.smsRecent.count)),
+                            systemImage: "tray.full"
+                        )
+                    }
+                    .adaptiveGlassButton()
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .padding(16)
+            }
+            .sheet(isPresented: $isPresentingSMSReceptionList) {
+                SMSReceptionListView()
+                    .environmentObject(appState)
             }
         }
     }
@@ -622,30 +889,203 @@ struct CellDockSettingsView: View {
         }
     }
 
-    private var moduleStatusStrip: some View {
-        HStack(spacing: 14) {
-            Text(cellularSummary)
-                .font(.callout.weight(.medium))
-                .lineLimit(1)
-
-            Spacer(minLength: 12)
-
-            HStack(spacing: 7) {
+    /// The full DJI 4G module status panel. All values are derived by
+    /// `ModemModuleStatusPresentation` from the existing state model — this view
+    /// only spells out display strings and never re-judges USB composition.
+    private var moduleStatusPanel: some View {
+        let present = ModemModuleStatusPresentation.derive(snapshot: appState.modem)
+        let statusColor = moduleStatusColor(for: present.status)
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
                 Circle()
-                    .fill(moduleStatusColor)
-                    .frame(width: 8, height: 8)
-                Text(moduleStatusText)
+                    .fill(statusColor)
+                    .frame(width: 10, height: 10)
+                Text(verbatim: "DJI 4G Module")
+                    .font(.headline)
+                Spacer()
+                Text(verbatim: statusName(present.status))
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(moduleStatusColor)
+                    .foregroundStyle(statusColor)
+            }
+
+            Divider()
+
+            panelRow(title: "Device", value: "QDC507")
+            panelRow(title: "USB", value: usbIdentityText)
+            panelRow(title: "Profile", value: profileName(present.profile))
+            panelRow(
+                title: "Configuration",
+                value: configurationText(present.configuration),
+                valueColor: configurationColor(present.configuration)
+            )
+            if case let .needsRepair(issue) = present.configuration {
+                Text(verbatim: issueText(issue))
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Spacer().frame(height: 0)
+            }
+            panelRow(title: "AT", value: interfaceText(present.at), valueColor: interfaceColor(present.at))
+            panelRow(title: "Network", value: interfaceText(present.network), valueColor: interfaceColor(present.network))
+            panelRow(title: "ADB", value: interfaceText(present.adb), valueColor: interfaceColor(present.adb))
+            panelRow(title: "Audio / UAC", value: audioText(present.audio))
+            panelRow(title: "USB Mode", value: usbModeText(present.usbMode))
+
+            modulePrimaryAction(for: present.usbMode)
+
+            if let configuration = appState.modem.usbConfiguration,
+               present.profile == .unsupported {
+                Divider()
+                Text(verbatim: "USBCFG  \(configuration.compactDescription)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
             }
         }
-        .adaptiveGlassSurface(
-            cornerRadius: 18,
-            padding: 16,
-            treatment: .clear,
-            tint: moduleStatusColor.opacity(0.045)
-        )
+        .padding(16)
+        .adaptiveGlassSurface(cornerRadius: 18, treatment: .regular)
         .accessibilityElement(children: .combine)
+    }
+
+    private func panelRow(title: String, value: String, valueColor: Color = .primary) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(verbatim: title)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            Text(verbatim: value)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(valueColor)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+
+    private var usbIdentityText: String {
+        guard let configuration = appState.modem.usbConfiguration else { return "—" }
+        return String(format: "%04X:%04X", configuration.vendorID, configuration.productID)
+    }
+
+    /// The primary USB-mode action associated with the module's current UAC
+    /// flag. UAC=1 → "Prepare for iPhone"; UAC=0 → "Switch to Mac / CellDock".
+    /// Either flag is a *valid* composition; this is a mode, never a repair.
+    @ViewBuilder
+    private func modulePrimaryAction(for usbMode: ModemModuleStatusPresentation.USBMode) -> some View {
+        switch usbMode {
+        case .mac:
+            mainUSBModeAction(
+                title: L10n.tr("Prepare for iPhone"),
+                systemImage: "iphone.badge.minus",
+                action: { appState.prepareForiPhone() }
+            )
+            Text(verbatim: L10n.tr("切换到 Mobile 会关闭 UAC，断开前请确认已选好 iPhone 目标。"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .mobile:
+            mainUSBModeAction(
+                title: L10n.tr("Switch to Mac / CellDock"),
+                systemImage: "desktopcomputer.arrow.left",
+                action: { appState.switchToMacUSBMode() }
+            )
+            Text(verbatim: L10n.tr("切换到 Mac 模式会重新开启 UAC。"))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    private func statusName(_ status: ModemModuleStatusPresentation.Status) -> String {
+        switch status {
+        case .disconnected: return "Disconnected"
+        case .detecting: return "Detecting"
+        case .initializing: return "Initializing"
+        case .ready: return "Ready"
+        case .configurationRequired: return "Configuration Required"
+        case .error: return "Error"
+        }
+    }
+
+    private func profileName(_ profile: ModemModuleStatusPresentation.Profile) -> String {
+        switch profile {
+        case .djiOriginal: return "DJI Original"
+        case .cellDockCompatible: return "CellDock Compatible"
+        case .unsupported: return "Unsupported"
+        }
+    }
+
+    private func configurationText(
+        _ configuration: ModemModuleStatusPresentation.Configuration
+    ) -> String {
+        switch configuration {
+        case .valid: return "Valid"
+        case .needsRepair: return "Needs Repair"
+        }
+    }
+
+    private func configurationColor(
+        _ configuration: ModemModuleStatusPresentation.Configuration
+    ) -> Color {
+        switch configuration {
+        case .valid: return .green
+        case .needsRepair: return .orange
+        }
+    }
+
+    private func issueText(
+        _ issue: ModemModuleStatusPresentation.RepairIssue
+    ) -> String {
+        switch issue {
+        case .diagDisabled: return "DIAG interface disabled"
+        case .nmeaDisabled: return "NMEA interface disabled"
+        case .atDisabled: return "AT interface disabled"
+        case .modemDisabled: return "Modem interface disabled"
+        case .networkDisabled: return "Network interface disabled"
+        case .adbDisabled: return "ADB interface disabled"
+        case let .unsupportedIdentity(identity): return "Unsupported VID/PID: \(identity)"
+        case .malformed: return "USBCFG 无法读取，需要重新检测。"
+        }
+    }
+
+    private func interfaceText(_ interface: ModemModuleStatusPresentation.Interface) -> String {
+        switch interface {
+        case .available: return "Ready"
+        case .unavailable: return "Unavailable"
+        case .notApplicable: return "—"
+        }
+    }
+
+    private func interfaceColor(
+        _ interface: ModemModuleStatusPresentation.Interface
+    ) -> Color {
+        switch interface {
+        case .available: return .green
+        case .unavailable: return .orange
+        case .notApplicable: return .secondary
+        }
+    }
+
+    private func audioText(_ audio: ModemModuleStatusPresentation.Audio) -> String {
+        switch audio {
+        case .enabled: return "Enabled"
+        case .disabled: return "Disabled"
+        case .notApplicable: return "—"
+        }
+    }
+
+    private func usbModeText(_ usbMode: ModemModuleStatusPresentation.USBMode) -> String {
+        switch usbMode {
+        case .mac: return "Mac / CellDock"
+        case .mobile: return "iPhone / Mobile"
+        case .unknown: return "—"
+        }
+    }
+
+    private func moduleStatusColor(for status: ModemModuleStatusPresentation.Status) -> Color {
+        switch status {
+        case .ready: return .green
+        case .configurationRequired: return .orange
+        case .error: return .red
+        case .detecting, .initializing: return .blue
+        case .disconnected: return .secondary
+        }
     }
 
     private var permissionSettings: some View {
@@ -839,36 +1279,6 @@ struct CellDockSettingsView: View {
         case .disabled: return L10n.tr("登录 Mac 后可在后台自动运行 CellDock")
         case .enabled: return L10n.tr("登录 Mac 后在后台运行 CellDock")
         case .unavailable: return L10n.tr("当前应用位置或用户会话不支持登录启动")
-        }
-    }
-
-    private var cellularSummary: String {
-        guard appState.modem.isConnected else { return L10n.tr("SIM 1 · 模块未连接") }
-        return (["SIM 1", appState.modem.operatorName, appState.modem.accessTechnology]
-            .compactMap { $0 })
-            .joined(separator: " · ")
-    }
-
-    private var moduleStatusText: String {
-        switch appState.modem.operationalState {
-        case .absent: return L10n.tr("模块未连接")
-        case .enumerating: return L10n.tr("USB 枚举中")
-        case .initializing: return L10n.tr("模块初始化中")
-        case .configurationRequired: return L10n.tr("模块需要配置")
-        case .ready: return L10n.tr("模块已连接")
-        case .restarting: return L10n.tr("模块正在重启")
-        case .reconnecting: return L10n.tr("模块重新连接中")
-        case .failed: return L10n.tr("模块异常")
-        }
-    }
-
-    private var moduleStatusColor: Color {
-        switch appState.modem.operationalState {
-        case .ready: return .green
-        case .configurationRequired: return .orange
-        case .failed: return .red
-        case .enumerating, .initializing, .restarting, .reconnecting: return .blue
-        case .absent: return .secondary
         }
     }
 

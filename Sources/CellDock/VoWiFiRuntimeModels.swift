@@ -6,6 +6,10 @@ import Foundation
 enum VoWiFiRuntimePhase: String, Equatable, Sendable {
     case starting
     case simReady = "sim_ready"
+    case simBlocked = "sim_blocked"
+    case networkBlocked = "network_blocked"
+    case tunnelBlocked = "tunnel_blocked"
+    case imsBlocked = "ims_blocked"
     case ready
     case stopped
     case error
@@ -14,6 +18,10 @@ enum VoWiFiRuntimePhase: String, Equatable, Sendable {
         switch self {
         case .starting: return L10n.tr("正在启动")
         case .simReady: return L10n.tr("SIM 已就绪")
+        case .simBlocked: return L10n.tr("正在进行 SIM/ISIM 鉴权")
+        case .networkBlocked: return L10n.tr("正在启动")
+        case .tunnelBlocked: return L10n.tr("正在建立 SWu/ePDG 隧道")
+        case .imsBlocked: return L10n.tr("正在注册运营商 IMS")
         case .ready: return L10n.tr("已就绪")
         case .stopped: return L10n.tr("已停止")
         case .error: return L10n.tr("错误")
@@ -230,6 +238,22 @@ enum VoWiFiSessionState: Equatable, Sendable {
         guard status.usesValidDataplane else {
             self = .failed(L10n.tr("SOCKS5 代理要求 vowifi-go 使用用户态数据面。"))
             return
+        }
+        switch status.phase {
+        case .simBlocked:
+            self = .authenticatingSIM(status)
+            return
+        case .networkBlocked:
+            self = .starting(status)
+            return
+        case .tunnelBlocked:
+            self = .establishingTunnel(status)
+            return
+        case .imsBlocked:
+            self = .registeringIMS(status)
+            return
+        case .starting, .simReady, .ready, .stopped, .error, nil:
+            break
         }
         if !status.isSIMReady {
             self = status.phase == .starting ? .starting(status) : .authenticatingSIM(status)

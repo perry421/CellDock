@@ -125,12 +125,29 @@ final class VoWiFiController: ObservableObject {
         desiredRunning.insert(moduleID)
         apply(.checking, to: moduleID)
 
+        voWiFiLogger.info("VoWiFi preflight start module=\(moduleID.rawValue, privacy: .public)")
+        // USB-composition acceptance is decoupled from the VoWiFi data path.
+        // Only an unrecognized/broken composition is a blocker; a QDC507 with
+        // USB audio/UAC disabled (audio=0) is a legal CellDock-compatible
+        // profile and does not gate VoWiFi.
+        switch module.modem.usbConfiguration?.usbProfile {
+        case .djiOriginal, .cellDockCompatible, nil:
+            voWiFiLogger.info("VoWiFi USB profile accepted module=\(moduleID.rawValue, privacy: .public)")
+        case let .unsupported?:
+            // Still attempt the launch; if it fails the egress/preflight stage
+            // below reports the precise reason. No silent rollback to audio=1.
+            voWiFiLogger.warning("VoWiFi USB profile=unsupported module=\(moduleID.rawValue, privacy: .public) continuing preflight")
+        }
+        voWiFiLogger.info("VoWiFi AT available module=\(moduleID.rawValue, privacy: .public)")
+
         guard let egress = VoWiFiEgress.current(excludingBSDNames: cellularInterfaceNames) else {
+            voWiFiLogger.error("VoWiFi preflight failed: no Mac network egress module=\(moduleID.rawValue, privacy: .public)")
             release(moduleID)
             desiredRunning.remove(moduleID)
             finish(.egressUnavailable(.noInternetInterface), for: moduleID)
             return
         }
+        voWiFiLogger.info("VoWiFi network interface available module=\(moduleID.rawValue, privacy: .public) egress=\(egress.bsdName, privacy: .public)")
         let upstream: VoWiFiUpstreamProxySnapshot?
         do {
             upstream = try upstreamSnapshot(for: module)

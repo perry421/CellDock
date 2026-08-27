@@ -43,6 +43,13 @@ struct CellularOverviewCard: View {
         resolvedModuleID.map(appState.isChangingNetworkMode(for:)) ?? appState.isChangingNetwork
     }
 
+    private var displayedRecoveryStatus: ModemRecoveryStatus? {
+        guard resolvedModuleID == appState.primaryDataModuleID || resolvedModuleID == nil else {
+            return nil
+        }
+        return appState.modemRecoveryStatus
+    }
+
     private var displayedConnectionState: CellularDataConnectionState {
         CellularDataConnectionPolicy.state(
             modem: displayedModem,
@@ -429,6 +436,9 @@ struct CellularOverviewCard: View {
     }
 
     private var operatorName: String {
+        if let recovery = displayedRecoveryStatus, recovery.stage != .connected {
+            return recovery.userTitle
+        }
         switch displayedModem.operationalState {
         case .ready, .configurationRequired:
             return displayedModem.operatorName ?? L10n.tr("等待运营商")
@@ -448,6 +458,9 @@ struct CellularOverviewCard: View {
     }
 
     private var signalSummary: String {
+        if let recovery = displayedRecoveryStatus, recovery.stage != .connected {
+            return recovery.userDetail
+        }
         switch displayedModem.operationalState {
         case .absent: return L10n.tr("等待插入 QDC507")
         case .enumerating: return L10n.tr("正在等待 USB/AT 接口")
@@ -469,6 +482,9 @@ struct CellularOverviewCard: View {
     }
 
     private var statusText: String {
+        if let recovery = displayedRecoveryStatus {
+            return recovery.userTitle
+        }
         switch displayedModem.operationalState {
         case .absent: return L10n.tr("未连接")
         case .enumerating: return L10n.tr("USB 枚举中")
@@ -482,6 +498,14 @@ struct CellularOverviewCard: View {
     }
 
     private var statusColor: Color {
+        if let recovery = displayedRecoveryStatus {
+            switch recovery.stage {
+            case .connected: return .green
+            case .failed: return recovery.needsUserAction ? .orange : .red
+            case .disconnected: return .gray
+            default: return .blue
+            }
+        }
         switch displayedModem.operationalState {
         case .absent: return .gray
         case .enumerating, .initializing, .restarting, .reconnecting: return .blue

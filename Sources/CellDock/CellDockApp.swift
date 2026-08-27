@@ -14,6 +14,7 @@ struct CellDockApp: App {
         _appState = StateObject(wrappedValue: state)
         state.start()
         appDelegate.configure(appState: state)
+        RemoteBridgeController.shared.configure(appState: state)
     }
 
     var body: some Scene {

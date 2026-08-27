@@ -1,5 +1,4 @@
 // swift-tools-version: 6.0
-
 import PackageDescription
 
 let package = Package(
@@ -11,7 +10,8 @@ let package = Package(
         .executable(name: "CellDock", targets: ["CellDock"]),
         .executable(name: "CellDockNetworkHelper", targets: ["CellDockNetworkHelper"]),
         .executable(name: "CellDockDialProbe", targets: ["CellDockDialProbe"]),
-        .executable(name: "CellDockSMSDeleteProbe", targets: ["CellDockSMSDeleteProbe"])
+        .executable(name: "CellDockSMSDeleteProbe", targets: ["CellDockSMSDeleteProbe"]),
+        .executable(name: "NeedleBridge", targets: ["NeedleBridge"])
     ],
     dependencies: [
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.4")
@@ -118,6 +118,28 @@ let package = Package(
         .executableTarget(
             name: "CellDockSMSDeleteProbe",
             dependencies: ["CModemBridge"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
+        .executableTarget(
+            name: "NeedleBridge",
+            dependencies: ["NeedleLibrary"],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
+        .target(
+            name: "NeedleLibrary",
+            dependencies: [],
+            swiftSettings: [
+                .swiftLanguageMode(.v5)
+            ]
+        ),
+        .executableTarget(
+            name: "NeedleTests",
+            dependencies: ["NeedleLibrary"],
+            path: "Tests/NeedleTests",
             swiftSettings: [
                 .swiftLanguageMode(.v5)
             ]

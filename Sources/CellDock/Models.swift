@@ -37,6 +37,54 @@ enum SIMState: Equatable {
     case queryFailed
 }
 
+/// State of the live "SMS reception via the QDC507 AT channel" feature.
+/// CellDock keeps this orthogonal to the SIM state — the SIM can be ready for
+/// data while the AT channel has not (yet) accepted a text-mode CNMI value.
+enum SMSServiceState: Equatable {
+    /// Feature disabled by the user; ModemService must not send `AT+CMGF=1`
+    /// or `AT+CNMI=...` and must drop any text-mode `+CMT:` URC it sees.
+    case disabled
+    /// The first AT command after a reset has not been issued yet.
+    case initializing
+    /// Both `AT+CMGF=1` and `AT+CNMI=1,2,0,0,0` succeeded; new `+CMT:` URCs
+    /// are delivered to `SMSManager`.
+    case ready
+    /// AT returned an error. CellDock keeps running 4G/data but stops
+    /// attempting to register for text-mode indications until the next
+    /// modem session is rebuilt (USB reconnect, sleep/wake, restart).
+    case error(String)
+}
+
+/// USB connection mode for the DJI / Quectel QDC507 module, derived from the
+/// UAC (USB Audio Class / "audio") flag of the `USBCFG` composition.
+///
+/// Only the UAC flag is ever toggled between these two modes; every other
+/// USBCFG field must remain byte-for-byte identical to what the module reports.
+enum USBConnectionMode: String, Equatable {
+    /// UAC = 1. For Mac / CellDock use, keeps USB Audio Class enabled for future
+    /// call audio over the module and retains the full USB capability.
+    case mac
+    /// UAC = 0. For iPhone / Mobile use, so iOS does not treat the module as a
+    /// USB sound card and take over the iPhone's own speaker.
+    case mobile
+}
+
+/// Machine state of the USB mode manager surfaced to the UI.
+enum USBModeState: Equatable {
+    /// Still determining the current mode from the module's USBCFG.
+    case loading
+    /// Current module USBCFG reports UAC = 1 (Mac / CellDock).
+    case mac
+    /// Current module USBCFG reports UAC = 0 (iPhone / Mobile).
+    case mobile
+    /// The module is present but its USBCFG cannot be recognized safely.
+    case unsupported
+    /// A USB mode transition is in progress.
+    case switching
+    /// A previous transition ended in an error.
+    case error(String)
+}
+
 enum CellularRegistrationState: Equatable {
     case unavailable
     case notRegistered
@@ -118,8 +166,83 @@ struct ModemUSBConfiguration: Equatable {
         self == Self.maVoTarget
     }
 
+    /// The USB-composition profile implied by this configuration.
+    ///
+    /// Only the `audio`/UAC flag is ever toggled between the two acceptable
+    /// QDC507 states. The core data-plane interfaces (diag/nmea/at/modem/net,
+    /// plus adb) must all be enabled for any state to count as legal; disabling
+    /// any of them — or presenting an unverified identity — is `unsupported`.
+    ///
+    /// - `.djiOriginal`: `2C7C:0125` with the UAC/audio flag on.
+    /// - `.cellDockCompatible`: `2C7C:0125` with the UAC/audio flag off, so an
+    ///   iPhone does not treat the module as a USB sound card. Still fully legal.
+    /// - `.unsupported`: any other composition (wrong identity, or a vital
+    ///   interface disabled).
+    enum USBConfigurationProfile: Equatable {
+        case djiOriginal
+        case cellDockCompatible
+        case unsupported
+    }
+
+    var usbProfile: USBConfigurationProfile {
+        guard vendorID == 0x2C7C, productID == 0x0125 else { return .unsupported }
+        guard diagnosticEnabled, nmeaEnabled, atPortEnabled, modemEnabled, networkEnabled,
+              adbEnabled else { return .unsupported }
+        return audioEnabled ? .djiOriginal : .cellDockCompatible
+    }
+
+    /// A QDC507 composition that CellDock can drive over CDC-ECM. Both the
+    /// DJI-original (audio=1) and CellDock-compatible (audio=0) profiles qualify.
+    var isRecognizedQDC507Profile: Bool {
+        usbProfile != .unsupported
+    }
+
+    /// Single source of truth for whether this composition is safe to drive.
+    ///
+    /// Equivalent to `isRecognizedQDC507Profile`; named so the UI, the USB mode
+    /// controller, and the self-tests all agree on the same contract. Both
+    /// `audio=1` (DJI/Mac) and `audio=0` (CellDock/Mobile) qualify; only a
+    /// disabled protected interface, an unverified identity, or a malformed
+    /// `USBCFG` is unsafe.
+    var knownSafe: Bool {
+        isRecognizedQDC507Profile
+    }
+
+    /// Whether the one-click Mac ↔ Mobile USB mode switch may be offered.
+    ///
+    /// This is intentionally the same predicate as `knownSafe` — a CellDock-
+    /// compatible `audio=0` profile is fully switchable, not merely tolerated.
+    var oneClickSwitchAllowed: Bool {
+        knownSafe
+    }
+
+    /// The USB mode implied by this configuration's UAC/audio flag.
+    /// UAC = 1 → `.mac`, UAC = 0 → `.mobile`.
+    var usbConnectionMode: USBConnectionMode {
+        audioEnabled ? .mac : .mobile
+    }
+
+    /// A copy of this configuration with UAC/audio toggled to the target mode.
+    /// All other fields — VID, PID, and the other six interface flags — are
+    /// preserved bit-for-bit from `self`. This is the only transformation the
+    /// USB mode manager is permitted to perform.
+    func switchingUSBMode(to mode: USBConnectionMode) -> ModemUSBConfiguration {
+        ModemUSBConfiguration(
+            vendorID: vendorID,
+            productID: productID,
+            diagnosticEnabled: diagnosticEnabled,
+            nmeaEnabled: nmeaEnabled,
+            atPortEnabled: atPortEnabled,
+            modemEnabled: modemEnabled,
+            networkEnabled: networkEnabled,
+            adbEnabled: adbEnabled,
+            audioEnabled: mode == .mac
+        )
+    }
+
     var isSafeIdentityConversionSource: Bool {
         isSafeDJISource || self == Self.maVoTargetWithoutADB || isCellDockTarget
+            || usbProfile == .cellDockCompatible
     }
 
     var identity: String {
@@ -284,7 +407,12 @@ struct ModemSnapshot: Equatable {
             return .unsupportedIdentity(normalizedIdentity)
         }
         guard let usbConfiguration else { return .inspecting }
-        guard usbConfiguration.isCellDockTarget else {
+        // Both the DJI-original (audio=1) and CellDock-compatible (audio=0)
+        // compositions of a QDC507 are legal. Only a genuinely broken
+        // composition (vital interface disabled, or unverified identity) is
+        // rejected, so an intentional audio/UAC=0 is never reported as needing
+        // configuration.
+        guard usbConfiguration.isRecognizedQDC507Profile else {
             return .unsupportedUSBConfiguration(usbConfiguration.compactDescription)
         }
         guard let usbNetMode else { return .inspecting }
@@ -329,6 +457,9 @@ struct CellularNetworkStatus: Equatable {
     /// Resolver addresses currently published for this exact network service.
     /// For DHCP-backed ECM services these originate from the active lease.
     var dnsServers: [String] = []
+    /// Low-frequency TCP reachability check bound to this exact ECM interface.
+    /// Nil means the interface is not ready or has not been probed yet.
+    var internetReachable: Bool?
     var lastError: String?
     var issue: CellularNetworkIssue?
 
@@ -651,6 +782,56 @@ struct ModemStoredPDU {
     let storage: String?
 }
 
+/// A single `+CMT:` URC produced by a modem configured for `AT+CMGF=1`
+/// (text-mode) delivery. CellDock keeps this fully separate from `SMSMessage`:
+/// `SMSMessage` is the end-user conversation entry that survives PDU decoding,
+/// storage polling, and cross-module merging. `ModemSMSMessage` is the raw,
+/// module-derived URC used by `SMSManager` to forward SIM-sourced SMS into
+/// the running session without touching the existing storage-polling pipeline.
+struct ModemSMSMessage: Identifiable, Equatable, Hashable {
+    /// Stable identifier for list selection and diffing. Hashing is
+    /// identity-based; `id` is a UUID so collisions are not a concern.
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(id)
+    }
+    static func == (lhs: ModemSMSMessage, rhs: ModemSMSMessage) -> Bool {
+        lhs.id == rhs.id
+    }
+    let id: UUID
+    let sender: String
+    /// SCTS timestamp decoded from the `+CMT:` header. `nil` when the modem
+    /// reported no timestamp or the timestamp did not parse.
+    let timestamp: Date?
+    /// Plain-text body. Always UTF-8; UCS-2 encodings must already be decoded
+    /// before the value lands here.
+    let body: String
+    let receivedAt: Date
+
+    init(
+        id: UUID = UUID(),
+        sender: String,
+        timestamp: Date?,
+        body: String,
+        receivedAt: Date = Date()
+    ) {
+        self.id = id
+        self.sender = sender
+        self.timestamp = timestamp
+        self.body = body
+        self.receivedAt = receivedAt
+    }
+}
+
+struct ModemTextModeCMTEvent: Equatable {
+    /// Decoded text-mode `+CMT:` URC. `body` is the line that follows the
+    /// header on the wire; it may be empty.
+    let message: ModemSMSMessage
+    /// Raw lines as observed by the URC framer — useful for diagnostics and
+    /// for the self-tests that exercise the coexistence with AT responses.
+    let rawHeader: String
+    let rawBody: String
+}
+
 struct ModemPDUReference: Codable, Hashable {
     let storage: String
     let index: Int
@@ -695,6 +876,10 @@ struct ModemMessageLocation: Hashable {
 struct ModemURCBatch {
     var messageLocations: [ModemMessageLocation] = []
     var directPDUs: [String] = []
+    /// Text-mode `+CMT:` deliveries — populated only when the modem has been
+    /// put into `AT+CMGF=1` and `AT+CNMI=1,2,0,0,0`. Kept on the same batch as
+    /// PDU deliveries so a single read can carry either shape.
+    var textModeCMTs: [ModemTextModeCMTEvent] = []
 }
 
 /// Frames modem URCs as a byte stream rather than assuming one USB read is one event.
@@ -726,7 +911,11 @@ struct ModemURCStreamFramer {
         var batch = ModemURCBatch()
         for rawLine in lines {
             let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !line.isEmpty else { continue }
+            // A line that is empty after trimming still counts as the body
+            // line of a pending text-mode `+CMT:` — do NOT skip it.
+            let isEmptyBodyOfPendingHeader =
+                line.isEmpty && pendingDirectCMTHeader != nil
+            guard !line.isEmpty || isEmptyBodyOfPendingHeader else { continue }
 
             if let header = pendingDirectCMTHeader {
                 if line.hasPrefix("+CMT:") {
@@ -735,6 +924,20 @@ struct ModemURCStreamFramer {
                     pendingDirectCMTHeader = line
                     pendingDirectCMTIgnoredLines = 0
                     continue
+                }
+                if ATResponseParser.isTextModeCMTHeader(header) {
+                    // Text-mode delivery is the path used when SMS reception is
+                    // enabled; the body is a plain UTF-8 line, not a PDU.
+                    // An empty body line is still a valid message — surface it.
+                    if let event = ModemURCStreamFramer.makeTextModeCMTEvent(
+                        header: header,
+                        body: line
+                    ) {
+                        batch.textModeCMTs.append(event)
+                        pendingDirectCMTHeader = nil
+                        pendingDirectCMTIgnoredLines = 0
+                        continue
+                    }
                 }
                 if let pdu = ATResponseParser.parseDirectCMT(
                     "\(header)\r\n\(line)\r\n"
@@ -771,6 +974,64 @@ struct ModemURCStreamFramer {
         pendingLine = ""
         pendingDirectCMTHeader = nil
         pendingDirectCMTIgnoredLines = 0
+    }
+
+    /// Best-effort parse for the text-mode `+CMT:` header. The format follows
+    /// 3GPP TS 27.005 §3.4: `+CMT: <oa>[,<alpha>],<scts>[,<to-oa>,<first-octet>,...>]`.
+    /// Many firmwares only emit the first three fields, so every later field is
+    /// optional. Returns `nil` for any unparseable header so the caller can
+    /// discard it without crashing.
+    static func makeTextModeCMTEvent(
+        header: String,
+        body: String,
+        now: Date = Date()
+    ) -> ModemTextModeCMTEvent? {
+        guard let parsed = parseTextModeCMTHeader(header) else { return nil }
+        let message = ModemSMSMessage(
+            sender: parsed.sender,
+            timestamp: parsed.timestamp,
+            body: body,
+            receivedAt: now
+        )
+        return ModemTextModeCMTEvent(
+            message: message,
+            rawHeader: header,
+            rawBody: body
+        )
+    }
+
+    private static func parseTextModeCMTHeader(_ header: String) -> (sender: String, timestamp: Date?)? {
+        // We can no longer rely on `hasPrefix("+CMT:")` here because the framer
+        // dispatches before us. Re-strip the prefix defensively.
+        var payload = String(header)
+        if payload.hasPrefix("+CMT:") { payload.removeFirst("+CMT:".count) }
+        payload = payload.trimmingCharacters(in: .whitespaces)
+
+        let fields = ATResponseParser.splitCSV(payload)
+        guard let senderField = fields.first else { return nil }
+        let sender = ATResponseParser.unquote(senderField)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        // Quoted alphanumeric sender with no `+` is preserved verbatim. A bare
+        // empty field (some firmwares emit `+CMT: ,...`) is treated as unknown.
+        let normalizedSender = sender.isEmpty ? "unknown" : sender
+
+        var timestamp: Date?
+        // Per 3GPP TS 27.005 §3.4, a text-mode `+CMT:` header is
+        // `<fo>,<mt>,<length>,<callerid>,<callerid_type>[,<toda>[,<scts>]]`.
+        // The SCTS timestamp is the 7th field (index 6), not the 2nd.
+        // The earlier draft indexed `fields[1]` which is `<mt>` and
+        // always empty — that left every text-mode timestamp nil.
+        // We scan for the first field that parses as a 3GPP SCTS.
+        for field in fields.dropFirst() {
+            let candidate = ATResponseParser.unquote(field)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !candidate.isEmpty,
+               let parsed = ATResponseParser.parseSCTSTimestamp(candidate) {
+                timestamp = parsed
+                break
+            }
+        }
+        return (normalizedSender, timestamp)
     }
 }
 

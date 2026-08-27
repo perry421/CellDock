@@ -12,6 +12,7 @@
 #include <mach/mach_error.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -47,6 +48,7 @@ struct CellDockModem {
     uint16_t product_id;
     uint32_t location_id;
     uint64_t registry_id;
+    uint8_t interface_count;
     uint8_t pipe_in;
     uint8_t pipe_out;
     uint8_t endpoint_in;
@@ -237,6 +239,41 @@ size_t celldock_modem_copy_devices(CellDockModemDevice *devices, size_t capacity
     return count;
 }
 
+static uint8_t count_known_interfaces(uint32_t required_location_id) {
+    io_iterator_t iterator = IO_OBJECT_NULL;
+    CFMutableDictionaryRef matching = IOServiceMatching(kIOUSBInterfaceClassName);
+    if (matching == NULL) {
+        return 0;
+    }
+    IOReturn result = IOServiceGetMatchingServices(
+        kIOMainPortDefault,
+        matching,
+        &iterator
+    );
+    if (result != kIOReturnSuccess) {
+        return 0;
+    }
+
+    uint8_t count = 0;
+    io_service_t candidate = IO_OBJECT_NULL;
+    while ((candidate = IOIteratorNext(iterator)) != IO_OBJECT_NULL) {
+        int vendor = 0;
+        int product = 0;
+        int location = 0;
+        integer_property(candidate, CFSTR("idVendor"), &vendor);
+        integer_property(candidate, CFSTR("idProduct"), &product);
+        integer_property(candidate, CFSTR("locationID"), &location);
+        if (is_known_modem_identity(vendor, product) &&
+            (required_location_id == 0 || (uint32_t)location == required_location_id) &&
+            count < UINT8_MAX) {
+            count++;
+        }
+        IOObjectRelease(candidate);
+    }
+    IOObjectRelease(iterator);
+    return count;
+}
+
 static io_service_t find_known_interface(
     int target_interface,
     uint32_t required_location_id,
@@ -326,17 +363,21 @@ static int discover_bulk_pipes(CellDockModem *modem) {
         uint8_t address = (uint8_t)(
             number | (direction == kUSBIn ? 0x80U : 0U)
         );
-        if (direction == kUSBIn && address == CELLDOCK_ENDPOINT_IN) {
-            modem->pipe_in = pipe;
-            modem->endpoint_in = address;
-        } else if (direction == kUSBOut && address == CELLDOCK_ENDPOINT_OUT) {
-            modem->pipe_out = pipe;
-            modem->endpoint_out = address;
+        if (direction == kUSBIn) {
+            if (address == CELLDOCK_ENDPOINT_IN || modem->pipe_in == 0) {
+                modem->pipe_in = pipe;
+                modem->endpoint_in = address;
+            }
+        } else if (direction == kUSBOut) {
+            if (address == CELLDOCK_ENDPOINT_OUT || modem->pipe_out == 0) {
+                modem->pipe_out = pipe;
+                modem->endpoint_out = address;
+            }
         }
     }
 
     if (modem->pipe_in == 0 || modem->pipe_out == 0) {
-        set_error(modem, "AT interface 2 does not expose bulk IN 0x84 / OUT 0x03");
+        set_error(modem, "AT interface 2 does not expose a bulk IN/OUT pair");
         return CELLDOCK_MODEM_NOT_FOUND;
     }
     return CELLDOCK_MODEM_OK;
@@ -419,6 +460,7 @@ void celldock_modem_close(CellDockModem *modem) {
     modem->product_id = 0;
     modem->location_id = 0;
     modem->registry_id = 0;
+    modem->interface_count = 0;
     modem->pipe_in = 0;
     modem->pipe_out = 0;
     modem->endpoint_in = 0;
@@ -508,6 +550,7 @@ int celldock_modem_open_for_location(CellDockModem *modem, uint32_t required_loc
     }
 
     set_error(modem, NULL);
+    uint8_t interface_count = count_known_interfaces(required_location_id);
     uint16_t vendor_id = 0;
     uint16_t product_id = 0;
     uint32_t discovered_location_id = 0;
@@ -521,9 +564,23 @@ int celldock_modem_open_for_location(CellDockModem *modem, uint32_t required_loc
         &registry_id
     );
     if (service == IO_OBJECT_NULL) {
+        fprintf(
+            stderr,
+            "CellDock USB device scan: no AT interface found requiredLocation=0x%08x interface count=%u\n",
+            required_location_id,
+            interface_count
+        );
         set_error(modem, "QDC507/Quectel USB module is not connected");
         return CELLDOCK_MODEM_NOT_FOUND;
     }
+    fprintf(
+        stderr,
+        "CellDock USB device detected: VID/PID=%04X:%04X location=0x%08x interface count=%u\n",
+        vendor_id,
+        product_id,
+        discovered_location_id,
+        interface_count
+    );
 
     IOCFPlugInInterface **plugin = NULL;
     SInt32 score = 0;
@@ -567,17 +624,28 @@ int celldock_modem_open_for_location(CellDockModem *modem, uint32_t required_loc
     modem->product_id = product_id;
     modem->location_id = discovered_location_id;
     modem->registry_id = registry_id;
+    modem->interface_count = interface_count;
     pthread_mutex_unlock(&modem->interface_lock);
     int pipe_result = discover_bulk_pipes(modem);
     if (pipe_result != CELLDOCK_MODEM_OK) {
+        fprintf(stderr, "CellDock USB transport open failure: %s\n", modem->last_error);
         celldock_modem_close(modem);
         return pipe_result;
     }
+    fprintf(
+        stderr,
+        "CellDock USB transport endpoints: OUT=0x%02X IN=0x%02X\n",
+        modem->endpoint_out,
+        modem->endpoint_in
+    );
     int sync_result = synchronize_at_stream(modem);
     if (sync_result != CELLDOCK_MODEM_OK) {
+        fprintf(stderr, "CellDock AT probe result: failure %s\n", modem->last_error);
         celldock_modem_close(modem);
         return sync_result;
     }
+    fprintf(stderr, "CellDock AT probe result: success\n");
+    fprintf(stderr, "CellDock USB transport open success\n");
     set_error(modem, NULL);
     return CELLDOCK_MODEM_OK;
 }
@@ -629,6 +697,10 @@ uint32_t celldock_modem_location_id(const CellDockModem *modem) {
 
 uint64_t celldock_modem_registry_id(const CellDockModem *modem) {
     return modem == NULL ? 0 : modem->registry_id;
+}
+
+uint8_t celldock_modem_interface_count(const CellDockModem *modem) {
+    return modem == NULL ? 0 : modem->interface_count;
 }
 
 uint8_t celldock_modem_input_endpoint(const CellDockModem *modem) {

@@ -1,10 +1,35 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 )
+
+func TestBlockedStageKeepsRuntimeHealthyUntilStopped(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	store := &statusStore{path: path, s: status{Running: true, Phase: "starting"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.block(ctx, "tunnel_blocked", errors.New("IKE response timeout")); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got status
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Running || got.Phase != "tunnel_blocked" || got.LastErrorClass != "" || got.LastReason != "IKE response timeout" {
+		t.Fatalf("blocked status=%+v", got)
+	}
+}
 
 func TestShouldProtectOuterIP(t *testing.T) {
 	for _, value := range []string{"127.0.0.1", "127.20.30.40", "::1", "0.0.0.0", "::"} {

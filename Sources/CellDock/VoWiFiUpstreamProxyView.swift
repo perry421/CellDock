@@ -197,9 +197,11 @@ private struct VoWiFiUpstreamProxyEditorView: View {
         configuration.host = trimmedHost
         configuration.name = trimmedName.isEmpty ? trimmedHost : trimmedName
         configuration.port = value
-        configuration.authentication = usesAuthentication
+        var updated = configuration
+        updated.authentication = usesAuthentication
             ? .usernamePassword(username: username)
             : .none
+        configuration = updated
         onSave(configuration, usesAuthentication ? password : nil)
     }
 }
