@@ -8,6 +8,7 @@ struct CellDockSettingsView: View {
         case sounds = "声音"
         case communications = "蜂窝与通信"
         case permissions = "通知与权限"
+        case diagnostics = "诊断"
         case updates = "软件更新"
 
         var title: String { L10n.tr(rawValue) }
@@ -18,6 +19,7 @@ struct CellDockSettingsView: View {
             case .sounds: return "speaker.wave.2.fill"
             case .communications: return "antenna.radiowaves.left.and.right"
             case .permissions: return "bell.badge"
+            case .diagnostics: return "stethoscope"
             case .updates: return "arrow.triangle.2.circlepath"
             }
         }
@@ -28,6 +30,7 @@ struct CellDockSettingsView: View {
             case .sounds: return L10n.tr("选择短信与来电使用的提示音")
             case .communications: return L10n.tr("查看模块状态并管理通话与短信处理")
             case .permissions: return L10n.tr("检查 CellDock 的系统访问权限")
+            case .diagnostics: return L10n.tr("查看只读状态并生成隐私安全的诊断报告")
             case .updates: return L10n.tr("检查版本并选择更新频道")
             }
         }
@@ -38,6 +41,7 @@ struct CellDockSettingsView: View {
             case .sounds: return L10n.tr("短信提示音与来电铃声")
             case .communications: return L10n.tr("通话、短信与转发")
             case .permissions: return L10n.tr("通知与系统访问权限")
+            case .diagnostics: return L10n.tr("模组、网络与服务状态")
             case .updates: return L10n.tr("版本与更新频道")
             }
         }
@@ -145,7 +149,7 @@ struct CellDockSettingsView: View {
                     )
                     settingsSidebarGroup(
                         L10n.tr("系统"),
-                        categories: [.permissions, .updates]
+                        categories: [.permissions, .diagnostics, .updates]
                     )
                 }
                 .padding(.horizontal, 12)
@@ -300,6 +304,8 @@ struct CellDockSettingsView: View {
             communicationSettings
         case .permissions:
             permissionSettings
+        case .diagnostics:
+            DiagnosticsView(appState: appState)
         case .updates:
             updateSettings
         }
