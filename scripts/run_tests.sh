@@ -116,6 +116,15 @@ swiftc \
 
 "$ROOT/.build/self-tests/SMSForwardingSelfTests"
 
+swiftc \
+  -swift-version 5 \
+  "$ROOT/Sources/CellDock/AppLanguage.swift" \
+  "$ROOT/Sources/CellDock/DiagnosticsModels.swift" \
+  "$ROOT/Tests/DiagnosticsSelfTests/main.swift" \
+  -o "$ROOT/.build/self-tests/DiagnosticsSelfTests"
+
+"$ROOT/.build/self-tests/DiagnosticsSelfTests"
+
 xcrun clang \
   -std=c11 \
   -O2 \
