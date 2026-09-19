@@ -67,10 +67,15 @@ enum ModemHardwareFamily: Equatable {
     static func classify(vendorName: String?, productName: String?) -> Self {
         let vendor = normalizedUSBName(vendorName)
         let product = normalizedUSBName(productName)
-        // Product wins deliberately: Baiwang devices can carry a Quectel VID,
-        // PID or vendor string after their USB identity has been customized.
-        if product == "BAIWANG" { return .baiwangInjectedVoice }
-        if vendor == "QUECTEL" { return .quectelNativeVoice }
+        // QDC507 devices can expose BAIWANG as the vendor and EG25G_QDC507 as
+        // the product while retaining Quectel's VID/PID. Check those customized
+        // identities before the native Quectel family.
+        if vendor == "BAIWANG" || product == "BAIWANG" || product?.contains("QDC507") == true {
+            return .baiwangInjectedVoice
+        }
+        if vendor == "QUECTEL" || product?.contains("EG25-G") == true {
+            return .quectelNativeVoice
+        }
         return .unknown
     }
 
@@ -222,6 +227,7 @@ struct ModemSnapshot: Equatable {
     var accessTechnology: String?
     var signalDBm: Int?
     var signalDetail: String?
+    var temperature = ModemTemperatureSnapshot()
     var simState: SIMState = .unavailable
     var simLastError: String?
     /// EPS/packet-domain registration reported by AT+CEREG?.

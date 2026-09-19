@@ -73,7 +73,7 @@ struct CallSnapshot: Equatable {
     }
 
     var canDial: Bool {
-        phase == .idle && voiceOverUSBSupported && !mediaCleanupPending
+        phase == .idle && !mediaCleanupPending
     }
 
     var canSendDTMF: Bool {

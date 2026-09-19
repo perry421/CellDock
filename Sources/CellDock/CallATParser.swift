@@ -8,10 +8,15 @@ enum PreferredCallMediaBackend: Equatable {
 
 enum CallATParser {
     static func normalizedDialNumber(_ value: String) -> String? {
-        guard !value.contains(where: { $0.isNewline || ($0.isWhitespace && $0 != " ") }) else {
+        guard !value.unicodeScalars.contains(where: CharacterSet.newlines.contains) else {
             return nil
         }
-        let compact = value.filter { $0 != " " && !"-()".contains($0) }
+        let displaySeparators = CharacterSet.whitespaces.union(
+            CharacterSet(charactersIn: "-‐‑‒–—−()（）")
+        )
+        let compact = String(String.UnicodeScalarView(
+            value.unicodeScalars.filter { !displaySeparators.contains($0) }
+        ))
         guard !compact.isEmpty, compact.count <= 32 else { return nil }
         for (offset, character) in compact.enumerated() {
             if "0123456789".contains(character) { continue }

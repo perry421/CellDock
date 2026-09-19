@@ -684,6 +684,8 @@
 "USB 语音接口已断开。" = "L’interface vocale USB a été déconnectée.";
 "USB 语音接口缺少可绑定的 locationID。" = "Il manque un locationID utilisable à l’interface vocale USB.";
 "USB 语音通道尚未就绪" = "Le canal vocal USB n’est pas prêt";
+"可接听；USB 语音通道尚未就绪" = "Vous pouvez répondre ; le canal vocal USB n’est pas prêt";
+"电话信令已工作；通话音频路径不可用。" = "La signalisation d’appel fonctionne, mais le chemin audio vocal est indisponible.";
 "USB 身份写入后的精确回读校验失败，未重启模块。" = "Échec de la relecture exacte après écriture de l’identité USB. Le module n’a pas redémarré.";
 "USB 身份和 CDC‑ECM 均已通过检查，可以开始使用。" = "L’identité USB et CDC‑ECM ont été validés. Le module est prêt à l’emploi.";
 "USB 身份和 CDC‑ECM 已通过检查；请再确认 SIM 卡已正确插入。" = "L’identité USB et CDC‑ECM ont été validés. Vérifiez que la carte SIM est correctement insérée.";
@@ -1681,3 +1683,16 @@
 "配置飞书机器人" = "Configurer le bot Feishu";
 "钉钉" = "DingTalk";
 "飞书" = "Feishu";
+"模块温度" = "Température du module";
+"模块温度 %lld°C" = "Température du module : %lld°C";
+"模块温度 %lld°C · %@" = "Température du module : %lld°C · %@";
+"主温度" = "Température principale";
+"传感器 2" = "Capteur 2";
+"传感器 3" = "Capteur 3";
+"最后成功更新" = "Dernière mise à jour réussie";
+"温度不可用" = "Température indisponible";
+"正常" = "Normale";
+"偏热" = "Élevée";
+"高温" = "Haute température";
+"严重高温警告" = "Alerte de température critique";
+"极高温 / 可能导致模块断网" = "Température extrême / risque de déconnexion du module";

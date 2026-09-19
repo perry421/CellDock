@@ -44,6 +44,7 @@ swiftc \
   "$ROOT/Sources/CellDock/ModuleVoicePayload.swift" \
   "$ROOT/Sources/CellDockNetworkIPC/CellDockNetworkIPC.swift" \
   "$ROOT/Sources/CellDockNetworkHelper/NetworkHelperState.swift" \
+  "$ROOT/Sources/CellDock/ModemTemperatureSnapshot.swift" \
   "$ROOT/Sources/CellDock/Models.swift" \
   "$ROOT/Sources/CellDock/QADBKeyDeriver.swift" \
   "$ROOT/Sources/CellDock/MessageConversation.swift" \

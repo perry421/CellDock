@@ -184,8 +184,7 @@ struct CompactCallContent: View {
             .adaptiveGlassButton(.prominent)
             .tint(.green)
             .disabled(
-                !appState.call.voiceOverUSBSupported ||
-                    appState.isChangingCall
+                appState.isChangingCall
             )
         }
     }

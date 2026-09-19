@@ -313,6 +313,21 @@ enum ATResponseParser {
         return nil
     }
 
+    static func parseQTemp(_ response: String) -> [Int]? {
+        guard let line = normalizedLines(response).first(where: {
+            $0.uppercased().hasPrefix("+QTEMP:")
+        }) else {
+            return nil
+        }
+        let payload = String(line.dropFirst("+QTEMP:".count))
+        let fields = splitCSV(payload)
+        guard fields.count >= 3 else { return nil }
+        let values = fields.prefix(3).compactMap {
+            Int($0.trimmingCharacters(in: .whitespaces))
+        }
+        return values.count == 3 ? values : nil
+    }
+
     static func parseCMGL(_ response: String) -> [ModemStoredPDU] {
         let lines = normalizedLines(response)
         var result: [ModemStoredPDU] = []

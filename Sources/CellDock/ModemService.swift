@@ -115,6 +115,8 @@ final class ModemService {
     private var nextSIMRefreshAt = Date.distantPast
     private var simFastPollingDeadline: Date?
     private var consecutiveSIMQueryFailures = 0
+    private var temperatureSnapshot = ModemTemperatureSnapshot()
+    private var nextTemperatureRefreshAt = Date.distantPast
     private var expectedRestartStartedAt: Date?
     private var expectedRestartObservedDisconnect = false
     private var isRunning = false
@@ -701,29 +703,11 @@ final class ModemService {
                 return
             }
             let token = self.beginCallAction()
-            self.voiceAudio.requestMicrophoneAccess { [weak self] granted in
-                guard let self else { return }
-                self.queue.async {
-                    guard granted else {
-                        self.invalidateCallAction()
-                        DispatchQueue.main.async {
-                            completion(.failure(L10n.tr("需要麦克风权限才能进行通话。请在系统设置中允许后重试。")))
-                        }
-                        return
-                    }
-                    guard self.isCurrentCallAction(token),
-                          self.callSnapshot.canDial,
-                          !self.hasPendingMediaCleanup,
-                          self.isOpen else {
-                        self.invalidateCallAction()
-                        DispatchQueue.main.async {
-                            completion(.failure(L10n.tr("拨号准备期间模块或通话状态已改变，请重试。")))
-                        }
-                        return
-                    }
-                    self.beginOutgoingCall(number, token: token, completion: completion)
-                }
-            }
+            // Request media permission without making AT call signalling depend
+            // on it. A modem call can still be placed when the Mac audio route
+            // is unavailable.
+            self.voiceAudio.requestMicrophoneAccess { _ in }
+            self.beginOutgoingCall(number, token: token, completion: completion)
         }
     }
 
@@ -738,28 +722,8 @@ final class ModemService {
                 return
             }
             let token = self.beginCallAction()
-            self.voiceAudio.requestMicrophoneAccess { [weak self] granted in
-                guard let self else { return }
-                self.queue.async {
-                    guard granted else {
-                        self.invalidateCallAction()
-                        DispatchQueue.main.async {
-                            completion(.failure(L10n.tr("需要麦克风权限才能接听。请在系统设置中允许后重试。")))
-                        }
-                        return
-                    }
-                    guard self.isCurrentCallAction(token),
-                          self.callSnapshot.phase == .incoming,
-                          self.isOpen else {
-                        self.invalidateCallAction()
-                        DispatchQueue.main.async {
-                            completion(.failure(L10n.tr("来电已结束或模块已断开。")))
-                        }
-                        return
-                    }
-                    self.beginAnsweringCall(token: token, completion: completion)
-                }
-            }
+            self.voiceAudio.requestMicrophoneAccess { _ in }
+            self.beginAnsweringCall(token: token, completion: completion)
         }
     }
 
@@ -1493,6 +1457,28 @@ final class ModemService {
             beginQDCOutgoingCall(number, token: token, completion: completion)
             return
         }
+        if callMediaBackend == .none {
+            let dial = callCommand("ATD\(number);", timeout: 12_000)
+            guard dial.isSuccess else {
+                if dial.isTransportAmbiguous {
+                    reconcileAmbiguousStart(completion: completion)
+                    return
+                }
+                failCallSetup(
+                    .failure(dial.error ?? callFailureMessage(from: dial.output)),
+                    completion: completion
+                )
+                return
+            }
+            invalidateCallAction()
+            callSnapshot.audioActive = false
+            callSnapshot.lastError = L10n.tr("电话信令已工作；通话音频路径不可用。")
+            callStateChangedAt = Date()
+            publishCallSnapshot()
+            DispatchQueue.main.async { completion(.success(L10n.tr("正在拨号…"))) }
+            queue.async { [weak self] in self?.refreshCallState() }
+            return
+        }
 
         preparePCMSessionAndAudio(token: token) { [weak self] result in
             guard let self else { return }
@@ -1539,6 +1525,29 @@ final class ModemService {
         publishCallSnapshot()
         if callMediaBackend == .qdcUAC {
             beginQDCAnsweringCall(token: token, completion: completion)
+            return
+        }
+        if callMediaBackend == .none {
+            let answer = callCommand("ATA", timeout: 12_000)
+            guard answer.isSuccess else {
+                if answer.isTransportAmbiguous {
+                    reconcileAmbiguousStart(completion: completion)
+                    return
+                }
+                failCallSetup(
+                    .failure(answer.error ?? callFailureMessage(from: answer.output)),
+                    completion: completion,
+                    preserveIncoming: true
+                )
+                return
+            }
+            invalidateCallAction()
+            callSnapshot.audioActive = false
+            callSnapshot.lastError = L10n.tr("电话信令已工作；通话音频路径不可用。")
+            callStateChangedAt = Date()
+            publishCallSnapshot()
+            DispatchQueue.main.async { completion(.success(L10n.tr("正在接通…"))) }
+            queue.async { [weak self] in self?.refreshCallState() }
             return
         }
         preparePCMSessionAndAudio(token: token) { [weak self] result in
@@ -1903,14 +1912,11 @@ final class ModemService {
     ) {
         guard isCurrentQDCMediaSession(session) else { return }
         qdcMediaStartInFlight = false
+        _ = disablePCMSessionIfNeeded()
+        cancelPendingQDCMediaSession()
         callSnapshot.audioActive = false
         callSnapshot.lastError = message
         publishCallSnapshot()
-        let confirmed = terminateAndConfirmCall(reason: .failed)
-        if confirmed {
-            callSnapshot.lastError = message
-            publishCallSnapshot()
-        }
     }
 
     private func reconcileAmbiguousStart(
@@ -2319,7 +2325,7 @@ final class ModemService {
     }
 
     private func setCallIdle(reason: CallEndReason? = nil, error: String? = nil) {
-        callSnapshot.phase = callSnapshot.voiceOverUSBSupported ? .idle : .unavailable
+        callSnapshot.phase = isOpen ? .idle : .unavailable
         callSnapshot.direction = nil
         callSnapshot.number = nil
         callSnapshot.audioActive = false
@@ -2407,6 +2413,8 @@ final class ModemService {
         modemRegistryID = identity
         modemLocationID = discoveredLocationID
         modemGeneration &+= 1
+        temperatureSnapshot = ModemTemperatureSnapshot()
+        nextTemperatureRefreshAt = .distantPast
         invalidateCallAction()
         return false
     }
@@ -2449,6 +2457,7 @@ final class ModemService {
         snapshot.registrationState = .unavailable
         snapshot.voiceRegistrationState = .unavailable
         snapshot.volteSessionAvailable = nil
+        markTemperatureUnavailable()
         snapshot.lastError = nil
         publishSnapshot(snapshot)
         resetSMSConnectionState()
@@ -2464,6 +2473,7 @@ final class ModemService {
         snapshot.registrationState = .unavailable
         snapshot.voiceRegistrationState = .unavailable
         snapshot.volteSessionAvailable = nil
+        markTemperatureUnavailable()
         snapshot.lastError = nil
         publishSnapshot(snapshot)
     }
@@ -2560,6 +2570,7 @@ final class ModemService {
                         simState: .unavailable,
                         lastError: L10n.tr("模组重启后 45 秒内未恢复 USB/AT 接口。")
                     )
+                    markTemperatureUnavailable()
                     publishSnapshot(snapshot)
                     return
                 }
@@ -2576,6 +2587,7 @@ final class ModemService {
                 let error = result == CELLDOCK_MODEM_NOT_FOUND ? nil : lastBridgeError()
                 if snapshot.state != newState || snapshot.lastError != error {
                     snapshot = ModemSnapshot(state: newState, lastError: error)
+                    markTemperatureUnavailable()
                     publishSnapshot(snapshot)
                 }
                 return
@@ -2603,6 +2615,7 @@ final class ModemService {
                     simState: .unavailable,
                     lastError: L10n.tr("模组重启后 45 秒内未恢复 USB/AT 接口。")
                 )
+                markTemperatureUnavailable()
                 publishSnapshot(snapshot)
                 return
             }
@@ -2611,6 +2624,7 @@ final class ModemService {
                 simState: .unavailable,
                 lastError: callSnapshot.hasCall ? L10n.tr("通话期间 AT 接口断开，正在恢复。") : nil
             )
+            markTemperatureUnavailable()
             publishSnapshot(snapshot)
             return
         }
@@ -2643,6 +2657,7 @@ final class ModemService {
             needsImmediateMessagePoll = false
             pollMessages()
         }
+        refreshTemperatureIfNeeded()
     }
 
     private func recoverExistingCallBeforeInitialization() -> Bool {
@@ -2690,6 +2705,8 @@ final class ModemService {
                 },
                 lastError: L10n.tr("模块中存在启动前已建立的通话。")
             )
+            temperatureSnapshot.markUnavailable()
+            snapshot.temperature = temperatureSnapshot
             publishSnapshot(snapshot)
             publishCallSnapshot()
             return true
@@ -2765,6 +2782,9 @@ final class ModemService {
                 celldock_modem_input_endpoint(modem)
             )
         )
+        temperatureSnapshot.markUnavailable()
+        snapshot.temperature = temperatureSnapshot
+        nextTemperatureRefreshAt = .distantPast
         beginSIMInitialization()
         publishSnapshot(snapshot)
 
@@ -2883,7 +2903,7 @@ final class ModemService {
         }
         pcmSessionEnabled = false
         callSnapshot = CallSnapshot(
-            phase: mediaAvailable ? .idle : .unavailable,
+            phase: .idle,
             voiceOverUSBSupported: mediaAvailable,
             lastError: mediaAvailable
                 ? nil
@@ -2922,6 +2942,9 @@ final class ModemService {
             ? nil
             : L10n.tr("模块已连接，但短信 PDU/CNMI 初始化失败。")
         refreshRadioSnapshot()
+        if isOpen {
+            refreshTemperatureSnapshot()
+        }
         needsImmediateMessagePoll = true
     }
 
@@ -2946,7 +2969,7 @@ final class ModemService {
                   !self.isShuttingDown,
                   !self.callSnapshot.hasCall,
                   !self.hasPendingMediaCleanup,
-                  self.callSnapshot.phase == .unavailable else {
+                  self.callSnapshot.phase == .idle else {
                 return
             }
             self.retryQDCInitializationAfterContention()
@@ -2975,7 +2998,7 @@ final class ModemService {
             publishCallSnapshot()
         } catch {
             callMediaBackend = .none
-            callSnapshot.phase = .unavailable
+            callSnapshot.phase = .idle
             callSnapshot.voiceOverUSBSupported = false
             callSnapshot.lastError = L10n.error(
                 "QDC507 通话组件尚不可用：%@",
@@ -3123,11 +3146,46 @@ final class ModemService {
         }
         guard isOpen else {
             snapshot = ModemSnapshot(state: .disconnected)
+            markTemperatureUnavailable()
             publishSnapshot(snapshot)
             return
         }
         snapshot.state = .connected
         publishSnapshot(snapshot)
+    }
+
+    private func refreshTemperatureIfNeeded() {
+        guard Date() >= nextTemperatureRefreshAt,
+              isOpen,
+              snapshot.isConnected,
+              !callSnapshot.hasCall,
+              !callActionInFlight,
+              !euiccOperationInFlight,
+              !commandInFlight else {
+            return
+        }
+        refreshTemperatureSnapshot()
+    }
+
+    private func refreshTemperatureSnapshot() {
+        nextTemperatureRefreshAt = Date().addingTimeInterval(10)
+        let response = command("AT+QTEMP", timeout: 3_000)
+        guard response.isSuccess,
+              let values = ATResponseParser.parseQTemp(response.output) else {
+            markTemperatureUnavailable()
+            publishSnapshot(snapshot)
+            return
+        }
+        temperatureSnapshot.sensorValuesCelsius = values
+        temperatureSnapshot.lastSuccessfulAt = Date()
+        temperatureSnapshot.isAvailable = true
+        snapshot.temperature = temperatureSnapshot
+        publishSnapshot(snapshot)
+    }
+
+    private func markTemperatureUnavailable() {
+        temperatureSnapshot.markUnavailable()
+        snapshot.temperature = temperatureSnapshot
     }
 
     private func pollMessages() {

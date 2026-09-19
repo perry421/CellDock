@@ -541,8 +541,7 @@ private struct CallIslandView: View {
     }
 
     private var canAnswer: Bool {
-        appState.call.voiceOverUSBSupported &&
-            !appState.isChangingCall
+        !appState.isChangingCall
     }
 
     private var canToggleRecording: Bool {

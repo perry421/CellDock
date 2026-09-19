@@ -460,12 +460,19 @@ struct CellularOverviewCard: View {
         }
         let parts = [
             displayedModem.accessTechnology,
-            displayedModem.signalDBm.map { "\($0) dBm" }
+            displayedModem.signalDBm.map { "\($0) dBm" },
+            displayedModem.temperature.primaryCelsius.map { "\($0)°C" },
+            temperatureWarningText
         ].compactMap { $0 }
         if !parts.isEmpty { return parts.joined(separator: " · ") }
         return displayedModem.operationalState == .configurationRequired
             ? L10n.tr("需要完成模组配置")
             : L10n.tr("正在读取信号")
+    }
+
+    private var temperatureWarningText: String? {
+        guard displayedModem.temperature.level != .normal else { return nil }
+        return displayedModem.temperature.localizedLevelText
     }
 
     private var statusText: String {

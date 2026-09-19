@@ -519,6 +519,11 @@ do {
         CallATParser.normalizedDialNumber("+86 (138) 0013-8000") == "+8613800138000",
         "formatted dial number normalization"
     )
+    try expect(
+        CallATParser.normalizedDialNumber("\u{00A0}+86（138）0013–8000\u{00A0}") == "+8613800138000",
+        "Unicode formatted dial number normalization"
+    )
+    try expect(CallATParser.normalizedDialNumber("手机号码") == nil, "UI label accepted as dial number")
     try expect(CallATParser.normalizedDialNumber("13800138000;ATH") == nil, "AT dial injection accepted")
     try expect(CallATParser.normalizedDialNumber("13800138000\r") == nil, "dial CR injection accepted")
     try expect(CallATParser.normalizedDialNumber("١٣٨٠٠١٣٨٠٠٠") == nil, "non-ASCII dial digits accepted")
@@ -696,6 +701,9 @@ do {
     }
     var readyCall = CallSnapshot(phase: .idle, voiceOverUSBSupported: true)
     try expect(readyCall.canDial, "clean idle call state cannot dial")
+    readyCall.voiceOverUSBSupported = false
+    try expect(readyCall.canDial, "missing audio route incorrectly blocked call signaling")
+    readyCall.voiceOverUSBSupported = true
     readyCall.lastError = "last recoverable error"
     try expect(readyCall.canDial, "ordinary display error permanently blocked dialing")
     readyCall.mediaCleanupPending = true
@@ -1191,6 +1199,41 @@ do {
     try expect(qcsq?.dbm == -96, "QCSQ RSRP")
     try expect(qcsq?.technology == "LTE", "QCSQ RAT")
     try expect(
+        ATResponseParser.parseQTemp("\r\n+QTEMP: 41,38,37\r\nOK\r\n") == [41, 38, 37],
+        "QTEMP three-sensor response"
+    )
+    try expect(ATResponseParser.parseQTemp("\r\nERROR\r\n") == nil, "QTEMP ERROR was accepted")
+    try expect(
+        ATResponseParser.parseQTemp("\r\n+QTEMP: 41,,37\r\nOK\r\n") == nil,
+        "QTEMP missing sensor was accepted"
+    )
+    try expect(
+        ATResponseParser.parseQTemp("\r\n+QTEMP: hot,38,37\r\nOK\r\n") == nil,
+        "QTEMP malformed sensor was accepted"
+    )
+    try expect(
+        ModemTemperatureSnapshot.level(for: 69) == .normal &&
+            ModemTemperatureSnapshot.level(for: 70) == .warm &&
+            ModemTemperatureSnapshot.level(for: 89) == .warm &&
+            ModemTemperatureSnapshot.level(for: 90) == .high &&
+            ModemTemperatureSnapshot.level(for: 104) == .high &&
+            ModemTemperatureSnapshot.level(for: 105) == .severe &&
+            ModemTemperatureSnapshot.level(for: 114) == .severe &&
+            ModemTemperatureSnapshot.level(for: 115) == .extreme,
+        "module temperature warning boundaries changed"
+    )
+    var unavailableTemperature = ModemTemperatureSnapshot(
+        sensorValuesCelsius: [41, 38, 37],
+        lastSuccessfulAt: Date(),
+        isAvailable: true
+    )
+    unavailableTemperature.markUnavailable()
+    try expect(
+        unavailableTemperature.primaryCelsius == nil &&
+            unavailableTemperature.lastSuccessfulAt != nil,
+        "failed temperature refresh exposed stale data or lost the last successful update"
+    )
+    try expect(
         ModemHardwareFamily.classify(vendorName: " Quectel ", productName: "EG25-G") ==
             .quectelNativeVoice,
         "Quectel USB vendor string was not classified as native voice"
@@ -1199,6 +1242,11 @@ do {
         ModemHardwareFamily.classify(vendorName: "Quectel", productName: "Baiwang") ==
             .baiwangInjectedVoice,
         "Baiwang product string did not take priority over a Quectel vendor string"
+    )
+    try expect(
+        ModemHardwareFamily.classify(vendorName: "BAIWANG", productName: "EG25G_QDC507") ==
+            .baiwangInjectedVoice,
+        "QDC507 production USB strings were not classified as injected voice hardware"
     )
     try expect(
         ModemHardwareFamily.classify(vendorName: nil, productName: "unknown") == .unknown,
@@ -2342,6 +2390,26 @@ do {
             readyModule.simSuffix == "1234" &&
             readyModule.selectorTitle == "模组 1 · 中国移动 · 5G",
         "ready cellular module presentation changed unexpectedly"
+    )
+    var heatedModem = readyModule.modem
+    heatedModem.temperature = ModemTemperatureSnapshot(
+        sensorValuesCelsius: [41, 38, 37],
+        lastSuccessfulAt: Date(),
+        isAvailable: true
+    )
+    let heatedModule = CellularModuleSummary(
+        id: readyModule.id,
+        displayName: readyModule.displayName,
+        modem: heatedModem,
+        network: readyModule.network,
+        cardKind: readyModule.cardKind,
+        isActiveSession: readyModule.isActiveSession,
+        isPrimaryData: readyModule.isPrimaryData
+    )
+    try expect(
+        heatedModule.selectorTitle == "模组 1 · 中国移动 · 5G · 41°C" &&
+            heatedModule.accessibilitySummary.contains("41°C"),
+        "available module temperature was not presented from the module snapshot"
     )
 
     let dataReadyModule = CellularModuleSummary(

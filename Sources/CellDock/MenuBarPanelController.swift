@@ -260,18 +260,28 @@ final class MenuBarPanelController: NSObject, NSWindowDelegate {
         let displaysCellularData = appState.presentedCellularNetworkingEnabled &&
             statusModule?.id == appState.primaryDataModuleID
         let displaysNetworkSpeed = shouldDisplayNetworkSpeed
-        statusItem?.length = displaysNetworkSpeed ? 68 : NSStatusItem.variableLength
-        button.image = CellDockStatusItemRenderer.image(
+        let statusImage = CellDockStatusItemRenderer.image(
             bars: statusModem.signalBars,
             modemState: statusModem.state,
             dataEnabled: displaysCellularData,
             callPhase: appState.call.phase,
             unreadMessageCount: appState.unreadCount,
             missedCallCount: appState.callHistory.unacknowledgedMissedCallCount,
+            temperature: statusModem.temperature,
             networkThroughput: displaysNetworkSpeed ? networkThroughput : nil
         )
+        statusItem?.length = statusImage.size.width + 4
+        button.image = statusImage
         button.title = ""
         var description = statusDescription
+        if let temperature = statusModem.temperature.primaryCelsius,
+           let level = statusModem.temperature.localizedLevelText {
+            description += "\n" + L10n.tr(
+                "模块温度 %lld°C · %@",
+                Int64(temperature),
+                level
+            )
+        }
         if displaysNetworkSpeed {
             description += "\n" + NetworkSpeedFormatter.detailedText(networkThroughput)
         }
@@ -704,6 +714,7 @@ private enum CellDockStatusItemRenderer {
         callPhase: CallPhase,
         unreadMessageCount: Int,
         missedCallCount: Int,
+        temperature: ModemTemperatureSnapshot,
         networkThroughput: NetworkThroughput?
     ) -> NSImage {
         let statusImage: NSImage
@@ -730,21 +741,25 @@ private enum CellDockStatusItemRenderer {
             )
         }
 
-        guard let networkThroughput else { return statusImage }
-        return networkSpeedImage(
+        guard temperature.primaryCelsius != nil || networkThroughput != nil else {
+            return statusImage
+        }
+        return combinedStatusImage(
             statusImage: statusImage,
+            temperature: temperature,
             throughput: networkThroughput
         )
     }
 
-    private static func networkSpeedImage(
+    private static func combinedStatusImage(
         statusImage: NSImage,
-        throughput: NetworkThroughput
+        temperature: ModemTemperatureSnapshot,
+        throughput: NetworkThroughput?
     ) -> NSImage {
-        // Keep only the native status-button inset. The previous 80 pt canvas
-        // plus 86 pt item left visibly oversized gutters around 65 pt of actual
-        // content.
-        let image = NSImage(size: NSSize(width: 64, height: 20), flipped: false) { _ in
+        let temperatureWidth: CGFloat = temperature.primaryCelsius == nil ? 0 : 34
+        let speedWidth: CGFloat = throughput == nil ? 0 : 44
+        let imageWidth = 20 + temperatureWidth + speedWidth
+        let image = NSImage(size: NSSize(width: imageWidth, height: 20), flipped: false) { _ in
             let iconBounds = NSRect(x: 0, y: 1, width: 20, height: 18)
             statusImage.draw(
                 in: aspectFitRect(for: statusImage.size, in: iconBounds),
@@ -753,6 +768,33 @@ private enum CellDockStatusItemRenderer {
                 fraction: 1
             )
 
+            if let primaryTemperature = temperature.primaryCelsius {
+                if let temperatureImage = configuredSymbol(
+                    named: temperature.menuBarSymbolName,
+                    fallback: "thermometer.medium",
+                    accessibilityDescription: L10n.tr("模块温度")
+                ) {
+                    temperatureImage.draw(
+                        in: aspectFitRect(
+                            for: temperatureImage.size,
+                            in: NSRect(x: 22, y: 4, width: 10, height: 12)
+                        ),
+                        from: .zero,
+                        operation: .sourceOver,
+                        fraction: 1
+                    )
+                }
+                let temperatureAttributes: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
+                    .foregroundColor: NSColor.black
+                ]
+                ("\(primaryTemperature)°" as NSString).draw(
+                    in: NSRect(x: 32, y: 4, width: 22, height: 13),
+                    withAttributes: temperatureAttributes
+                )
+            }
+
+            guard let throughput else { return true }
             let lines = NetworkSpeedFormatter.menuBarLines(throughput)
             let paragraph = NSMutableParagraphStyle()
             // A fixed-width item avoids the neighboring menu icons jumping as
@@ -769,12 +811,13 @@ private enum CellDockStatusItemRenderer {
                 .foregroundColor: NSColor.black,
                 .paragraphStyle: paragraph
             ]
+            let speedOriginX = 23 + temperatureWidth
             (lines.download as NSString).draw(
-                in: NSRect(x: 23, y: 10, width: 41, height: 10),
+                in: NSRect(x: speedOriginX, y: 10, width: 41, height: 10),
                 withAttributes: attributes
             )
             (lines.upload as NSString).draw(
-                in: NSRect(x: 23, y: 0, width: 41, height: 10),
+                in: NSRect(x: speedOriginX, y: 0, width: 41, height: 10),
                 withAttributes: attributes
             )
             return true

@@ -508,6 +508,7 @@ struct SIMManagementView: View {
                         esimOverviewCard
                         esimProfilesCard
                     } else {
+                        temperatureInformationCard
                         moduleInformationCard
                     }
                 }
@@ -567,6 +568,7 @@ struct SIMManagementView: View {
         var parts = [module.statusText]
         if let technology = module.technologyName { parts.append(technology) }
         if let signal = module.modem.signalDBm { parts.append("\(signal) dBm") }
+        if let temperature = module.temperatureText { parts.append(temperature) }
         return parts.joined(separator: " · ")
     }
 
@@ -1490,6 +1492,67 @@ struct SIMManagementView: View {
         .adaptiveGlassCard()
     }
 
+    private var temperatureInformationCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(L10n.tr("模块温度"))
+                .font(.headline)
+                .padding(.bottom, 10)
+
+            informationRow(
+                title: "主温度",
+                value: primaryTemperatureText,
+                valueColor: temperatureValueColor
+            )
+
+            if selectedModem.temperature.isAvailable {
+                Divider()
+                informationRow(
+                    title: "传感器 2",
+                    value: sensorTemperatureText(at: 1)
+                )
+                Divider()
+                informationRow(
+                    title: "传感器 3",
+                    value: sensorTemperatureText(at: 2)
+                )
+            }
+
+            if let lastSuccessfulAt = selectedModem.temperature.lastSuccessfulAt {
+                Divider()
+                informationRow(
+                    title: "最后成功更新",
+                    value: lastSuccessfulAt.formatted(
+                        date: .abbreviated,
+                        time: .standard
+                    )
+                )
+            }
+        }
+        .adaptiveGlassCard()
+    }
+
+    private var primaryTemperatureText: String {
+        guard let temperature = selectedModem.temperature.primaryCelsius,
+              let level = selectedModem.temperature.localizedLevelText else {
+            return L10n.tr("温度不可用")
+        }
+        return "\(temperature)°C · \(level)"
+    }
+
+    private func sensorTemperatureText(at index: Int) -> String {
+        selectedModem.temperature.sensorCelsius(at: index).map { "\($0)°C" }
+            ?? L10n.tr("温度不可用")
+    }
+
+    private var temperatureValueColor: Color {
+        switch selectedModem.temperature.level {
+        case .normal: return .secondary
+        case .warm: return .orange
+        case .high, .severe, .extreme: return .red
+        case nil: return .secondary
+        }
+    }
+
     private func informationRow(
         title: String,
         value: String,
@@ -1884,7 +1947,7 @@ private struct SIMModuleSidebarRow: View {
     }
 
     private var moduleTitle: String {
-        [module.localizedDisplayName, module.carrierName, module.technologyName]
+        [module.localizedDisplayName, module.carrierName, module.technologyName, module.temperatureText]
             .compactMap { $0 }
             .joined(separator: " · ")
     }

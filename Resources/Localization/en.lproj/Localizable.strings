@@ -705,6 +705,8 @@
 "USB 语音接口已断开。" = "The USB voice interface is disconnected.";
 "USB 语音接口缺少可绑定的 locationID。" = "The USB voice interface is missing a bindable locationID.";
 "USB 语音通道尚未就绪" = "USB voice channel not ready yet";
+"可接听；USB 语音通道尚未就绪" = "Answering is available; the USB voice channel is not ready";
+"电话信令已工作；通话音频路径不可用。" = "Call signaling is working; the voice audio path is unavailable.";
 "USB 身份写入后的精确回读校验失败，未重启模块。" = "Exact readback verification after writing the USB identity failed. The module was not restarted.";
 "USB 身份和 CDC‑ECM 均已通过检查，可以开始使用。" = "USB identity and CDC‑ECM passed verification. The module is ready to use.";
 "USB 身份和 CDC‑ECM 已通过检查；请再确认 SIM 卡已正确插入。" = "USB identity and CDC‑ECM passed verification. Confirm that the SIM card is inserted correctly.";
@@ -1684,3 +1686,16 @@
 "配置飞书机器人" = "Configure Feishu Bot";
 "钉钉" = "DingTalk";
 "飞书" = "Feishu";
+"模块温度" = "Module Temperature";
+"模块温度 %lld°C" = "Module temperature %lld°C";
+"模块温度 %lld°C · %@" = "Module temperature %lld°C · %@";
+"主温度" = "Primary Temperature";
+"传感器 2" = "Sensor 2";
+"传感器 3" = "Sensor 3";
+"最后成功更新" = "Last Successful Update";
+"温度不可用" = "Temperature Unavailable";
+"正常" = "Normal";
+"偏热" = "Warm";
+"高温" = "High Temperature";
+"严重高温警告" = "Severe Temperature Warning";
+"极高温 / 可能导致模块断网" = "Extreme Temperature / Module May Disconnect";

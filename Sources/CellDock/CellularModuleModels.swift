@@ -43,9 +43,13 @@ struct CellularModuleSummary: Identifiable, Equatable {
     }
 
     var selectorTitle: String {
-        [localizedDisplayName, modem.simReady ? carrierName : nil, technologyName]
+        [localizedDisplayName, modem.simReady ? carrierName : nil, technologyName, temperatureText]
             .compactMap { $0 }
             .joined(separator: " · ")
+    }
+
+    var temperatureText: String? {
+        modem.temperature.primaryCelsius.map { "\($0)°C" }
     }
 
     var accessibilitySummary: String {
@@ -55,6 +59,9 @@ struct CellularModuleSummary: Identifiable, Equatable {
             if let technologyName { parts.append(technologyName) }
             if let signalDBm = modem.signalDBm {
                 parts.append(L10n.tr("信号 %lld dBm", Int64(signalDBm)))
+            }
+            if let primaryTemperature = modem.temperature.primaryCelsius {
+                parts.append(L10n.tr("模块温度 %lld°C", Int64(primaryTemperature)))
             }
         }
         if isPrimaryData { parts.append(L10n.tr("主上网")) }

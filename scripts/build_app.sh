@@ -97,7 +97,8 @@ else
     "=designated => identifier \"app.celldock.mac.network.helper\" and certificate leaf = H\"$SIGN_CERT_SHA1\""
   )
 fi
-OUTPUT_DIR="$ROOT/outputs"
+OUTPUT_DIR="${CELLDOCK_OUTPUT_DIR:-$ROOT/outputs}"
+APP_ENTITLEMENTS="$ROOT/Resources/CellDock.entitlements"
 APP="$OUTPUT_DIR/CellDock.app"
 ARCHIVE_ARCH="universal"
 BUILD_ARCH_OPTIONS=(--arch arm64 --arch x86_64)
@@ -114,6 +115,7 @@ VERIFY_APP="$VERIFY_DIR/CellDock.app"
 HELPER_RELATIVE="Contents/Library/PrivilegedHelperTools/CellDockNetworkHelper"
 VOWIFI_RUNTIME_RELATIVE="Contents/Library/PrivilegedHelperTools/CellDockVoWiFiRuntime"
 PLIST_RELATIVE="Contents/Library/LaunchDaemons/app.celldock.mac.network.helper.plist"
+plutil -lint "$APP_ENTITLEMENTS" >/dev/null
 cleanup() {
   /bin/rm -rf -- "$STAGE_DIR"
   /bin/rm -f -- "$PUBLISH_ZIP"
@@ -154,26 +156,30 @@ fi
 cp "$BIN_DIR/CellDock" "$STAGE_APP/Contents/MacOS/CellDock"
 cp "$BIN_DIR/CellDockNetworkHelper" "$STAGE_APP/$HELPER_RELATIVE"
 VOWIFI_GO_ROOT="$ROOT/ThirdParty/vowifi-go"
-[[ -f "$VOWIFI_GO_ROOT/go.mod" && -d "$VOWIFI_GO_ROOT/vendor" ]] || {
-  print -u2 "Vendored vowifi-go runtime source is missing."
-  exit 1
-}
-mkdir -p "$STAGE_DIR/vowifi"
-for GO_ARCH in arm64 amd64; do
-  OUTPUT_ARCH="$GO_ARCH"
-  [[ "$GO_ARCH" == amd64 ]] && OUTPUT_ARCH="x86_64"
-  (
-    cd "$VOWIFI_GO_ROOT"
-    CGO_ENABLED=0 GOOS=darwin GOARCH="$GO_ARCH" \
-      go build -mod=vendor -trimpath -ldflags='-s -w' \
-      -o "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-$OUTPUT_ARCH" \
-      ./cmd/celldock-vowifi-runtime
-  )
-done
-lipo -create \
-  "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-arm64" \
-  "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-x86_64" \
-  -output "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
+if [[ -n "${CELLDOCK_VOWIFI_RUNTIME_SOURCE:-}" ]]; then
+  cp "$CELLDOCK_VOWIFI_RUNTIME_SOURCE" "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
+else
+  [[ -f "$VOWIFI_GO_ROOT/go.mod" && -d "$VOWIFI_GO_ROOT/vendor" ]] || {
+    print -u2 "Vendored vowifi-go runtime source is missing."
+    exit 1
+  }
+  mkdir -p "$STAGE_DIR/vowifi"
+  for GO_ARCH in arm64 amd64; do
+    OUTPUT_ARCH="$GO_ARCH"
+    [[ "$GO_ARCH" == amd64 ]] && OUTPUT_ARCH="x86_64"
+    (
+      cd "$VOWIFI_GO_ROOT"
+      CGO_ENABLED=0 GOOS=darwin GOARCH="$GO_ARCH" \
+        go build -mod=vendor -trimpath -ldflags='-s -w' \
+        -o "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-$OUTPUT_ARCH" \
+        ./cmd/celldock-vowifi-runtime
+    )
+  done
+  lipo -create \
+    "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-arm64" \
+    "$STAGE_DIR/vowifi/CellDockVoWiFiRuntime-x86_64" \
+    -output "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
+fi
 chmod 0755 "$STAGE_APP/$VOWIFI_RUNTIME_RELATIVE"
 cp "$ROOT/Resources/app.celldock.mac.network.helper.plist" "$STAGE_APP/$PLIST_RELATIVE"
 [[ -d "$SPARKLE_FRAMEWORK_SOURCE" ]] || {
@@ -228,6 +234,7 @@ codesign \
   --force \
   --sign "$SIGN_IDENTITY" \
   "${CODESIGN_OPTIONS[@]}" \
+  --entitlements "$APP_ENTITLEMENTS" \
   "${APP_REQUIREMENT_OPTIONS[@]}" \
   --identifier app.celldock.mac \
   "$STAGE_APP"
@@ -281,6 +288,11 @@ if [[ "$SIGNING_MODE" != development ]]; then
     }
   done
 fi
+APP_SIGNED_ENTITLEMENTS="$(codesign -d --entitlements :- "$VERIFY_APP" 2>/dev/null)"
+[[ "$APP_SIGNED_ENTITLEMENTS" == *"com.apple.security.device.audio-input"* ]] || {
+  print -u2 "Archive app is missing the audio-input entitlement."
+  exit 1
+}
 plutil -lint "$VERIFY_APP/Contents/Info.plist"
 plutil -lint "$VERIFY_PLIST"
 [[ "$(plutil -extract CFBundleShortVersionString raw "$VERIFY_APP/Contents/Info.plist")" == "$VERSION" ]] || {

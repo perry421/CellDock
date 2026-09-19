@@ -652,9 +652,11 @@ private struct ActiveCallView: View {
                     }
                 }
 
-                Text(canAnswer ? L10n.tr("使用 Mac 接听") : L10n.tr("USB 语音通道尚未就绪"))
+                Text(appState.call.voiceOverUSBSupported
+                    ? L10n.tr("使用 Mac 接听")
+                    : L10n.tr("可接听；USB 语音通道尚未就绪"))
                     .font(.caption)
-                    .foregroundStyle(canAnswer ? Color.secondary : Color.orange)
+                    .foregroundStyle(appState.call.voiceOverUSBSupported ? Color.secondary : Color.orange)
             }
             .frame(maxWidth: 390)
 
@@ -811,8 +813,7 @@ private struct ActiveCallView: View {
     }
 
     private var canAnswer: Bool {
-        appState.call.voiceOverUSBSupported &&
-            !appState.isChangingCall
+        !appState.isChangingCall
     }
 
     private func toggleRecording() {
